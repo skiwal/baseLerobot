@@ -1,0 +1,52 @@
+<mujoco model="so100_pick_task">
+  <!-- 抓取任务场景: SO-100 + 矮台 + 方块 + 相机
+       机器人与缓存都在 ../cache/mujoco_menagerie/trs_so_arm100/ 下
+
+       注意: MuJoCo 的 compiler 设置只在主文件生效, 被 include 的文件里
+       的 meshdir 会被忽略, 因此这里必须显式指定网格目录。 -->
+  <include file="../../cache/mujoco_menagerie/trs_so_arm100/so_arm100.xml"/>
+
+  <compiler angle="radian" meshdir="../../cache/mujoco_menagerie/trs_so_arm100/assets/"/>
+
+  <option cone="elliptic" impratio="10" timestep="0.002"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.35 0.35 0.35" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="45" elevation="-20" offwidth="1280" offheight="1280"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <material name="wood" rgba="0.55 0.42 0.30 1"/>
+    <material name="cube_mat" rgba="0.85 0.30 0.15 1"/>
+    <material name="pedestal_mat" rgba="0.45 0.48 0.52 1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- 矮台: 顶面 z=0.085, 方块放在上面 -->
+    <body name="pedestal" pos="0 -0.24 0">
+      <geom name="pedestal_geom" type="box" size="0.07 0.07 0.0425" pos="0 0 0.0425"
+        material="pedestal_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <!-- 待抓取的方块: 3cm, 中心 z = 0.085 + 0.015 = 0.100 -->
+    <body name="pick_cube" pos="0 -0.24 0.100">
+      <freejoint name="cube_freejoint"/>
+      <geom name="cube_geom" type="box" size="0.015 0.015 0.015" material="cube_mat"
+        friction="1 0.005 0.0001" condim="4" solimp="2 1 0.01" solref="0.01 1"/>
+    </body>
+
+    <!-- 第三方视角相机 (策略的观测相机) -->
+    <camera name="side" pos="0.42 -0.52 0.36" xyaxes="0.80 0.60 0 -0.31 0.41 0.86" fovy="50"/>
+    <!-- 更近的特写相机, 用于观察 -->
+    <camera name="closeup" pos="0.25 -0.42 0.25" xyaxes="0.83 0.56 0 -0.35 0.52 0.78" fovy="55"/>
+  </worldbody>
+</mujoco>

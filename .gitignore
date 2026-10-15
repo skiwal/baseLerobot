@@ -1,0 +1,10 @@
+.vscode/
+cache/
+outputs/
+so100_sim/out/
+so100_sim/*.log
+__pycache__/
+*/*.mp4
+*/*.img
+*/*.png
+final_videos
