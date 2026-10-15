@@ -1,0 +1,143 @@
+<mujoco model="so100_sleeve_task">
+  <!-- 套筒-细杆插装任务场景: SO-100 + 工作台 + 任意倾角细杆 + 可抓取空心套筒
+
+       布局(为什么这样摆, 都是实测定下来的 -> 臂只有 5 自由度, 可行姿态很挑):
+         - 套筒**横躺**在两个 V 型托架上, 轴线沿 ±y, 中心高度 z=0.12。横躺而不是立着,
+           是因为它只有 32g / 60mm 高, 立着时中段被垫片一推(>0.13N)就会倒;
+           躺在 V 托架里则被约束住, 只受竖直方向的夹持力。
+         - 夹取姿态 = 手指朝下、夹紧方向沿 ±x, 也就是抓取任务(so100_pick_env)里已经验证过的姿态族,
+           套筒轴线正好落在夹爪的 z_h 轴上, 只需腕部微调就能对准细杆。
+         - 细杆(insert_rod)从台面后方的立柱上水平伸出、指向机器人, 半径 5mm、露出 80mm;
+           姿态由 env 在 reset 时写入 model.body_pos/body_quat(任意倾角, 默认 +y 方向倾斜 20°/30°)。
+
+       实测可达性(y≈-0.2 附近): 套筒中心 z∈[0.10,0.12] 与 y∈[-0.17,-0.24] 内,
+       位置(3)+轴线方向(2) 五个约束都能精确满足, 倾角 0~45°、任意方位都能对准。
+
+       为什么套筒不用 mesh:
+         MuJoCo 的碰撞只支持凸体, 带孔的圆柱用 mesh 会退化成实心凸包, 杆就插不进去。
+         这里用 16 片盒体壁板拼出环壁: 每片的内侧切于 r=8mm 的圆、外侧 r=15mm(径向半厚 3.5mm),
+         切向半宽 2.58mm(比 22.5° 弦长多 15% 重叠)。同一 body 内部 geom 之间不产生碰撞,
+         所以重叠没有副作用。两端另有 16 片 45° 斜板构成内孔导入喇叭口(8mm -> 11mm),
+         让对准误差有容差。
+
+       注意: MuJoCo 的 compiler 设置只在主文件生效, 被 include 的文件里的 meshdir 会被忽略。 -->
+  <include file="../../cache/mujoco_menagerie/trs_so_arm100/so_arm100.xml"/>
+
+  <compiler angle="radian" meshdir="../../cache/mujoco_menagerie/trs_so_arm100/assets/"/>
+
+  <option cone="elliptic" impratio="10" timestep="0.002"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.35 0.35 0.35" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="45" elevation="-20" offwidth="1280" offheight="1280"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <material name="table_mat" rgba="0.42 0.40 0.38 1"/>
+    <material name="cradle_mat" rgba="0.30 0.33 0.38 1"/>
+    <material name="sleeve_mat" rgba="0.72 0.77 0.84 1" specular="0.7" shininess="0.6" reflectance="0.08"/>
+    <material name="rod_mat" rgba="0.88 0.48 0.14 1" specular="0.5" shininess="0.5"/>
+    <material name="rod_base_mat" rgba="0.25 0.26 0.29 1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- 工作台: 顶面 z = 0.04。台面压低是因为"手指朝下"这个姿态族的可达高度上限约 0.13,
+         而指尖比夹持中心低 55mm, 台面太高指尖就会插进台面里。 -->
+    <body name="work_table" pos="0 -0.22 0">
+      <geom name="table_geom" type="box" size="0.11 0.10 0.02" pos="0 0 0.02"
+        material="table_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <!-- V 型托架 x2: 细长立柱 + V 口, 把套筒横托住(中心 z=0.11, 轴线沿 ±y)。
+         位置刻意和细杆同轴(x=0): 这样抓起来以后只要沿轴向滑动就能套到杆上, 不用抬起/横移。
+         立柱很细(6mm 宽), 贴着套筒两端的内侧(y=-0.21 / -0.17), 夹爪垫片只占中间 ±12mm,
+         两根立柱正好落在指尖两侧的空隙里。 -->
+    <body name="sleeve_cradle" pos="0 0 0">
+      <geom name="cradle_post_0" type="box" size="0.006 0.003 0.02639" pos="0 -0.2060 0.06639" material="cradle_mat" friction="0.05 0.005 0.0001"/>
+      <geom name="cradle_v_0_p" type="box" size="0.002 0.003 0.011" pos="0.00707 -0.2060 0.09303" quat="0.923880 0.000000 0.382683 0.000000" material="cradle_mat" friction="0.05 0.005 0.0001" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="cradle_v_0_n" type="box" size="0.002 0.003 0.011" pos="-0.00707 -0.2060 0.09303" quat="0.923880 0.000000 -0.382683 0.000000" material="cradle_mat" friction="0.05 0.005 0.0001" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="cradle_post_1" type="box" size="0.006 0.003 0.02639" pos="0 -0.1660 0.06639" material="cradle_mat" friction="0.05 0.005 0.0001"/>
+      <geom name="cradle_v_1_p" type="box" size="0.002 0.003 0.011" pos="0.00707 -0.1660 0.09303" quat="0.923880 0.000000 0.382683 0.000000" material="cradle_mat" friction="0.05 0.005 0.0001" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="cradle_v_1_n" type="box" size="0.002 0.003 0.011" pos="-0.00707 -0.1660 0.09303" quat="0.923880 0.000000 -0.382683 0.000000" material="cradle_mat" friction="0.05 0.005 0.0001" solimp="2 1 0.01" solref="0.02 1"/>
+    </body>
+
+    <!-- 细杆: 从后方立柱水平伸出指向机器人。局部 +z 就是杆轴(默认沿 +y), 杆尖在局部 z=0.08。
+         姿态由 env 的 set_rod_pose() 写 model.body_pos/body_quat 任意倾角。 -->
+    <body name="rod_post" pos="0 -0.30 0.0825">
+      <geom name="rod_post_geom" type="box" size="0.018 0.012 0.0425" material="rod_base_mat" friction="1 0.005 0.0001"/>
+    </body>
+    <body name="insert_rod" pos="0 -0.30 0.113" quat="0.707105 -0.707108 0 0">
+      <geom name="rod_base_geom" type="cylinder" size="0.009 0.004" pos="0 0 0.004"
+        material="rod_base_mat" friction="1 0.005 0.0001"/>
+      <geom name="rod_geom" type="cylinder" size="0.005 0.040" pos="0 0 0.040"
+        material="rod_mat" friction="0.8 0.005 0.0001"/>
+    </body>
+
+    <!-- 套筒: 空心圆柱 30mm(外) x 16mm(内) x 60mm(长), 横躺在 V 托架上(轴线沿 +y) -->
+    <body name="sleeve" pos="0.000 -0.186 0.110" quat="0.707105 -0.707108 0 0">
+      <freejoint name="sleeve_freejoint"/>
+      <geom name="sleeve_wall_00" type="box" size="0.003500 0.002580 0.0300" pos="0.011500 0.000000 0" quat="1.000000 0 0 0.000000" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_01" type="box" size="0.003500 0.002580 0.0300" pos="0.010625 0.004401 0" quat="0.980785 0 0 0.195090" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_02" type="box" size="0.003500 0.002580 0.0300" pos="0.008132 0.008132 0" quat="0.923880 0 0 0.382683" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_03" type="box" size="0.003500 0.002580 0.0300" pos="0.004401 0.010625 0" quat="0.831470 0 0 0.555570" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_04" type="box" size="0.003500 0.002580 0.0300" pos="0.000000 0.011500 0" quat="0.707107 0 0 0.707107" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_05" type="box" size="0.003500 0.002580 0.0300" pos="-0.004401 0.010625 0" quat="0.555570 0 0 0.831470" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_06" type="box" size="0.003500 0.002580 0.0300" pos="-0.008132 0.008132 0" quat="0.382683 0 0 0.923880" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_07" type="box" size="0.003500 0.002580 0.0300" pos="-0.010625 0.004401 0" quat="0.195090 0 0 0.980785" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_08" type="box" size="0.003500 0.002580 0.0300" pos="-0.011500 0.000000 0" quat="0.000000 0 0 1.000000" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_09" type="box" size="0.003500 0.002580 0.0300" pos="-0.010625 -0.004401 0" quat="-0.195090 0 0 0.980785" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_10" type="box" size="0.003500 0.002580 0.0300" pos="-0.008132 -0.008132 0" quat="-0.382683 0 0 0.923880" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_11" type="box" size="0.003500 0.002580 0.0300" pos="-0.004401 -0.010625 0" quat="-0.555570 0 0 0.831470" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_12" type="box" size="0.003500 0.002580 0.0300" pos="-0.000000 -0.011500 0" quat="-0.707107 0 0 0.707107" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_13" type="box" size="0.003500 0.002580 0.0300" pos="0.004401 -0.010625 0" quat="-0.831470 0 0 0.555570" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_14" type="box" size="0.003500 0.002580 0.0300" pos="0.008132 -0.008132 0" quat="-0.923880 0 0 0.382683" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_wall_15" type="box" size="0.003500 0.002580 0.0300" pos="0.010625 -0.004401 0" quat="-0.980785 0 0 0.195090" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_00" type="box" size="0.0009 0.002580 0.00212" pos="0.009500 0.000000 0.02850" quat="0.923880 0.000000 0.382683 0.000000" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_01" type="box" size="0.0009 0.002580 0.00212" pos="0.008777 0.003635 0.02850" quat="0.906127 -0.074658 0.375330 0.180240" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_02" type="box" size="0.0009 0.002580 0.00212" pos="0.006718 0.006718 0.02850" quat="0.853553 -0.146447 0.353553 0.353553" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_03" type="box" size="0.0009 0.002580 0.00212" pos="0.003635 0.008777 0.02850" quat="0.768178 -0.212608 0.318190 0.513280" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_04" type="box" size="0.0009 0.002580 0.00212" pos="0.000000 0.009500 0.02850" quat="0.653281 -0.270598 0.270598 0.653281" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_05" type="box" size="0.0009 0.002580 0.00212" pos="-0.003635 0.008777 0.02850" quat="0.513280 -0.318190 0.212608 0.768178" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_06" type="box" size="0.0009 0.002580 0.00212" pos="-0.006718 0.006718 0.02850" quat="0.353553 -0.353553 0.146447 0.853553" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_07" type="box" size="0.0009 0.002580 0.00212" pos="-0.008777 0.003635 0.02850" quat="0.180240 -0.375330 0.074658 0.906127" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_08" type="box" size="0.0009 0.002580 0.00212" pos="-0.009500 0.000000 0.02850" quat="0.000000 -0.382683 0.000000 0.923880" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_09" type="box" size="0.0009 0.002580 0.00212" pos="-0.008777 -0.003635 0.02850" quat="-0.180240 -0.375330 -0.074658 0.906127" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_10" type="box" size="0.0009 0.002580 0.00212" pos="-0.006718 -0.006718 0.02850" quat="-0.353553 -0.353553 -0.146447 0.853553" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_11" type="box" size="0.0009 0.002580 0.00212" pos="-0.003635 -0.008777 0.02850" quat="-0.513280 -0.318190 -0.212608 0.768178" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_12" type="box" size="0.0009 0.002580 0.00212" pos="-0.000000 -0.009500 0.02850" quat="-0.653281 -0.270598 -0.270598 0.653281" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_13" type="box" size="0.0009 0.002580 0.00212" pos="0.003635 -0.008777 0.02850" quat="-0.768178 -0.212608 -0.318190 0.513280" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_14" type="box" size="0.0009 0.002580 0.00212" pos="0.006718 -0.006718 0.02850" quat="-0.853553 -0.146447 -0.353553 0.353553" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_top_15" type="box" size="0.0009 0.002580 0.00212" pos="0.008777 -0.003635 0.02850" quat="-0.906127 -0.074658 -0.375330 0.180240" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_00" type="box" size="0.0009 0.002580 0.00212" pos="0.009500 0.000000 -0.02850" quat="0.923880 0.000000 -0.382683 0.000000" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_01" type="box" size="0.0009 0.002580 0.00212" pos="0.008777 0.003635 -0.02850" quat="0.906127 0.074658 -0.375330 0.180240" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_02" type="box" size="0.0009 0.002580 0.00212" pos="0.006718 0.006718 -0.02850" quat="0.853553 0.146447 -0.353553 0.353553" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_03" type="box" size="0.0009 0.002580 0.00212" pos="0.003635 0.008777 -0.02850" quat="0.768178 0.212608 -0.318190 0.513280" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_04" type="box" size="0.0009 0.002580 0.00212" pos="0.000000 0.009500 -0.02850" quat="0.653281 0.270598 -0.270598 0.653281" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_05" type="box" size="0.0009 0.002580 0.00212" pos="-0.003635 0.008777 -0.02850" quat="0.513280 0.318190 -0.212608 0.768178" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_06" type="box" size="0.0009 0.002580 0.00212" pos="-0.006718 0.006718 -0.02850" quat="0.353553 0.353553 -0.146447 0.853553" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_07" type="box" size="0.0009 0.002580 0.00212" pos="-0.008777 0.003635 -0.02850" quat="0.180240 0.375330 -0.074658 0.906127" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_08" type="box" size="0.0009 0.002580 0.00212" pos="-0.009500 0.000000 -0.02850" quat="0.000000 0.382683 -0.000000 0.923880" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_09" type="box" size="0.0009 0.002580 0.00212" pos="-0.008777 -0.003635 -0.02850" quat="-0.180240 0.375330 0.074658 0.906127" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_10" type="box" size="0.0009 0.002580 0.00212" pos="-0.006718 -0.006718 -0.02850" quat="-0.353553 0.353553 0.146447 0.853553" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_11" type="box" size="0.0009 0.002580 0.00212" pos="-0.003635 -0.008777 -0.02850" quat="-0.513280 0.318190 0.212608 0.768178" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_12" type="box" size="0.0009 0.002580 0.00212" pos="-0.000000 -0.009500 -0.02850" quat="-0.653281 0.270598 0.270598 0.653281" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_13" type="box" size="0.0009 0.002580 0.00212" pos="0.003635 -0.008777 -0.02850" quat="-0.768178 0.212608 0.318190 0.513280" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_14" type="box" size="0.0009 0.002580 0.00212" pos="0.006718 -0.006718 -0.02850" quat="-0.853553 0.146447 0.353553 0.353553" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+      <geom name="sleeve_ch_bot_15" type="box" size="0.0009 0.002580 0.00212" pos="0.008777 -0.003635 -0.02850" quat="-0.906127 0.074658 0.375330 0.180240" material="sleeve_mat" density="900" friction="1.8 0.02 0.0001" condim="4" solimp="2 1 0.01" solref="0.02 1"/>
+    </body>
+
+    <!-- 相机: side 是策略观测视角, closeup 看插装细节, top 俯视工作区 -->
+    <camera name="side" pos="0.380 -0.460 0.330" xyaxes="0.5812 0.8137 -0.0000 -0.3431 0.2451 0.9068" fovy="50"/>
+    <camera name="closeup" pos="0.200 -0.400 0.260" xyaxes="0.7452 0.6668 -0.0000 -0.3029 0.3385 0.8909" fovy="50"/>
+    <camera name="top" pos="0.060 -0.330 0.560" xyaxes="0.2606 0.9655 -0.0000 -0.9569 0.2584 0.1354" fovy="50"/>
+  </worldbody>
+</mujoco>
