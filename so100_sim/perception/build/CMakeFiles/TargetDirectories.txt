@@ -1,0 +1,3 @@
+/home/ubuntu/code/baseLerobot/so100_sim/perception/build/CMakeFiles/perceive.dir
+/home/ubuntu/code/baseLerobot/so100_sim/perception/build/CMakeFiles/edit_cache.dir
+/home/ubuntu/code/baseLerobot/so100_sim/perception/build/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/perceive.dir/link.d CMakeFiles/perceive.dir/src/perceive.c.o -o perceive  -lm
