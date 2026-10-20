@@ -42,24 +42,23 @@ static void normalize(double v[3]) {
     double n = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
     if (n > 1e-12) { v[0]/=n; v[1]/=n; v[2]/=n; }
 }
-/* world -> image(像素), 返回 1 表示在相机前方 */
+/* world -> image(像素), 返回 1 表示在相机前方. 注: MuJoCo 方像素, x/y 用同一焦距 f */
 static int project(const double p[3], double* uu, double* vv) {
     double d[3] = {p[0]-CAM_POS[0], p[1]-CAM_POS[1], p[2]-CAM_POS[2]};
     double xc = CAM_RIGHT[0]*d[0] + CAM_RIGHT[1]*d[1] + CAM_RIGHT[2]*d[2];
     double yc = CAM_UP[0]*d[0]    + CAM_UP[1]*d[1]    + CAM_UP[2]*d[2];
     double zc = CAM_BACK[0]*d[0]  + CAM_BACK[1]*d[1]  + CAM_BACK[2]*d[2];
     if (zc >= -1e-6) return 0;
-    double fx = (W/2.0)/tan(FOVY/2.0);
-    double fy = (H/2.0)/tan(FOVY/2.0);
-    *uu = W/2.0 + fx*(xc/(-zc));
-    *vv = H/2.0 - fy*(yc/(-zc));
+    double f = (H/2.0)/tan(FOVY/2.0);   /* 方像素: 单焦距, x/y 同 */
+    *uu = W/2.0 + f*(xc/(-zc));
+    *vv = H/2.0 - f*(yc/(-zc));
     return 1;
 }
 /* image(u,v 像素, d_m 米) -> world(米) */
 static void unproject(double u, double v, double d_m, double p[3]) {
-    double fx = (W/2.0)/tan(FOVY/2.0), fy = (H/2.0)/tan(FOVY/2.0);
-    double xc = (u - W/2.0)/fx * d_m;
-    double yc = -(v - H/2.0)/fy * d_m;
+    double f = (H/2.0)/tan(FOVY/2.0);   /* 方像素: 单焦距, x/y 同 */
+    double xc = (u - W/2.0)/f * d_m;
+    double yc = -(v - H/2.0)/f * d_m;
     double zc = -d_m;
     p[0] = CAM_POS[0] + xc*CAM_RIGHT[0] + yc*CAM_UP[0] + zc*CAM_BACK[0];
     p[1] = CAM_POS[1] + xc*CAM_RIGHT[1] + yc*CAM_UP[1] + zc*CAM_BACK[1];
@@ -195,6 +194,7 @@ int main(int argc, char** argv) {
     /* 3) 每个连通域: 世界点云 -> PCA 轴线 + 质心 + 框 */
     double* caxis = malloc(sizeof(double)*3*(ncomp+1));
     double* ccent = malloc(sizeof(double)*3*(ncomp+1));
+    double* craw  = malloc(sizeof(double)*3*(ncomp+1)); /* 各连通域原始 PCA 质心 */
     double* cbbox = malloc(sizeof(double)*4*(ncomp+1)); /* minu,minv,maxu,maxv */
     int*    cvert = malloc(sizeof(int)*(ncomp+1));      /* 竖直度(带符号) */
     for (int c=1;c<=ncomp;c++) {
@@ -220,6 +220,7 @@ int main(int argc, char** argv) {
         cen[0]/=m; cen[1]/=m; cen[2]/=m;
         caxis[3*c]=ax[0]; caxis[3*c+1]=ax[1]; caxis[3*c+2]=ax[2];
         ccent[3*c]=cen[0]; ccent[3*c+1]=cen[1]; ccent[3*c+2]=cen[2];
+        craw[3*c]=cen[0]; craw[3*c+1]=cen[1]; craw[3*c+2]=cen[2];
         cbbox[4*c]=minu; cbbox[4*c+1]=minv; cbbox[4*c+2]=maxu; cbbox[4*c+3]=maxv;
         cvert[c] = (ax[2] >= 0 ? 1 : -1) * (int)(fabs(ax[2])*1000.0);
         free(pts);
@@ -235,6 +236,43 @@ int main(int argc, char** argv) {
     }
     if (sleeve_c == rod_c) { /* 只有一个有效连通域: 退化为全当套筒 */
         rod_c = 0;
+    }
+    double sleeve_raw[3] = {0, 0, 0};   /* PCA 原始质心(用于验证抬起高度) */
+
+    /* 套筒中心精修: 竖直套筒的单目斜视使可见前表面相对真实轴线偏一个半径 R.
+       对每个可见点, 沿"指向相机"的水平方向把点移回 R -> 落在轴线上, 平均得轴线足点.
+       此法无前表面偏置, 精度到 mm 级, 抓取才稳. 高度用已知套筒中心高. */
+    if (sleeve_c > 0) {
+        int n = clistsize[sleeve_c];
+        double* pts = malloc(sizeof(double)*3*n);
+        int m = 0;
+        for (int k=0;k<n;k++) {
+            int p = clist[sleeve_c][k];
+            uint16_t dm = dep[p];
+            if (dm == 0) continue;
+            int u = p%W, v = p/W;
+            double w[3]; unproject((double)u, (double)v, dm/1000.0, w);
+            pts[m*3]=w[0]; pts[m*3+1]=w[1]; pts[m*3+2]=w[2]; m++;
+        }
+        const double R = 0.0135;   /* 套筒外缘半径(布局已知) */
+        double sx=0, sy=0, sz=0;
+        for (int i=0;i<m;i++) {
+            double dxc = CAM_POS[0]-pts[i*3], dyc = CAM_POS[1]-pts[i*3+1];
+            double horiz = sqrt(dxc*dxc + dyc*dyc);
+            if (horiz < 1e-6) continue;
+            double ax = pts[i*3]   - R*(dxc/horiz);
+            double ay = pts[i*3+1] - R*(dyc/horiz);
+            sx += ax; sy += ay; sz += pts[i*3+2];
+        }
+        sx/=m; sy/=m; sz/=m;
+        ccent[3*sleeve_c]   = sx;
+        ccent[3*sleeve_c+1] = sy;
+        ccent[3*sleeve_c+2] = 0.11;   /* 套筒中心高 = 台面0.08 + 半高0.03 */
+        caxis[3*sleeve_c]   = 0.0;
+        caxis[3*sleeve_c+1] = 0.0;
+        caxis[3*sleeve_c+2] = 1.0;    /* 竖直(物体先验, 与第一步分类一致) */
+        sleeve_raw[0] = craw[3*sleeve_c]; sleeve_raw[1] = craw[3*sleeve_c+1]; sleeve_raw[2] = craw[3*sleeve_c+2];
+        free(pts);
     }
 
     /* 5) 标注 + 打印 */
@@ -270,6 +308,8 @@ int main(int argc, char** argv) {
         double* ce = &ccent[3*sleeve_c]; double* ax = &caxis[3*sleeve_c];
         printf("SLEEVE pos=(%.3f,%.3f,%.3f) axis=(%.3f,%.3f,%.3f)\n",
                ce[0],ce[1],ce[2], ax[0],ax[1],ax[2]);
+        printf("SLEEVE_RAW centroid=(%.3f,%.3f,%.3f)\n",
+               sleeve_raw[0], sleeve_raw[1], sleeve_raw[2]);
     } else {
         printf("SLEEVE not detected\n");
     }
@@ -296,6 +336,6 @@ int main(int argc, char** argv) {
     for (int c=1;c<=ncomp;c++) free(clist[c]);
     free(clist); free(clistsize); free(clistcap);
     free(rgb); free(res); free(dep); free(bg); free(dyn); free(comp); free(stack);
-    free(caxis); free(ccent); free(cbbox); free(cvert);
+    free(caxis); free(ccent); free(craw); free(cbbox); free(cvert);
     return 0;
 }

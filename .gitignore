@@ -8,3 +8,5 @@ __pycache__/
 */*.img
 */*.png
 final_videos
+so100_sim/perception/build
+so100_sim/perception/data
