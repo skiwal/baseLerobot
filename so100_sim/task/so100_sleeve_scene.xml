@@ -53,7 +53,7 @@
     <!-- 工作台: 顶面 z = 0.04。台面压低是因为"手指朝下"这个姿态族的可达高度上限约 0.13,
          而指尖比夹持中心低 55mm, 台面太高指尖就会插进台面里。 -->
     <body name="work_table" pos="0 -0.22 0">
-      <geom name="table_geom" type="box" size="0.11 0.10 0.02" pos="0 0 0.02"
+      <geom name="table_geom" type="box" size="0.165 0.06 0.04" pos="0 0 0.04"
         material="table_mat" friction="1 0.005 0.0001"/>
     </body>
 
@@ -72,13 +72,15 @@
 
     <!-- 细杆: 从后方立柱水平伸出指向机器人。局部 +z 就是杆轴(默认沿 +y), 杆尖在局部 z=0.08。
          姿态由 env 的 set_rod_pose() 写 model.body_pos/body_quat 任意倾角。 -->
-    <body name="rod_post" pos="0 -0.30 0.0825">
+    <body name="rod_post" pos="-0.06 -0.20 0.045">
       <geom name="rod_post_geom" type="box" size="0.018 0.012 0.0425" material="rod_base_mat" friction="1 0.005 0.0001"/>
     </body>
-    <body name="insert_rod" pos="0 -0.30 0.113" quat="0.707105 -0.707108 0 0">
+    <body name="rod_rest" pos="-0.06 -0.20 0.085" quat="0.707105 -0.707108 0 0">
       <geom name="rod_base_geom" type="cylinder" size="0.009 0.004" pos="0 0 0.004"
         material="rod_base_mat" friction="1 0.005 0.0001"/>
-      <geom name="rod_geom" type="cylinder" size="0.005 0.040" pos="0 0 0.040"
+      <geom name="rod_geom" type="cylinder" size="0.004 0.036" pos="0 0 0.036"
+        material="rod_mat" friction="0.8 0.005 0.0001"/>
+      <geom name="rod_tip_cap" type="sphere" size="0.004" pos="0 0 0.072"
         material="rod_mat" friction="0.8 0.005 0.0001"/>
     </body>
 
@@ -139,5 +141,8 @@
     <camera name="side" pos="0.380 -0.460 0.330" xyaxes="0.5812 0.8137 -0.0000 -0.3431 0.2451 0.9068" fovy="50"/>
     <camera name="closeup" pos="0.200 -0.400 0.260" xyaxes="0.7452 0.6668 -0.0000 -0.3029 0.3385 0.8909" fovy="50"/>
     <camera name="top" pos="0.060 -0.330 0.560" xyaxes="0.2606 0.9655 -0.0000 -0.9569 0.2584 0.1354" fovy="50"/>
+    <!-- RGB-D 相机: 装在机械臂根部(基座), 略微偏机器人左手边(+x)并抬高, 避开臂体避免穿模。
+         视野朝向工作区(套筒+杆), 机械臂缩回(不伸出去)时即可同时看到两者, 用于感知/抓取规划。 -->
+    <camera name="base_rgbd" pos="0.08 -0.04 0.30" xyaxes="-0.9796 0.2009 0.0000 -0.1424 -0.6943 0.7054" fovy="50"/>
   </worldbody>
 </mujoco>

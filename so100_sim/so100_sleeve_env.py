@@ -2,17 +2,20 @@
 """SO-100 套筒-细杆插装任务环境 (MuJoCo)。
 
 任务
-    台面上立着一根**任意倾角**的细杆(半径 5mm), 旁边立着一个**空心套筒**
-    (外径 30mm / 内孔 16mm / 长 60mm)。机械臂要把套筒抓起来, 把内孔对准细杆轴线,
-    再把套筒推到杆外(杆插入内孔 >= 30mm 记为成功)。
+    台面上**竖直立着一个空心套筒**(正六棱柱, 对边 26mm / 内孔 16mm / 长 60mm),
+    旁边斜向上固定着一个**任意倾角的细杆**(半径 5mm, 与托座焊死, 不晃动)。
+    机械臂要把套筒抓起来, 把内孔对准细杆轴线, 再把套筒推到杆上
+    (杆插入内孔 >= 30mm 记为成功)。套筒是自由体(可被推倒), 细杆固定。
+
+    (插装算法本身是后续研发目标, 本文件先把场景 + 抓取链路做实; 见"已知限制"。)
 
 抓取方式 (为什么这样设计)
     夹爪指尖方向 = 手部 y_h 轴, 夹紧方向 = x_h 轴, 第三轴 z_h = 垂直于"指面"。
-    套筒**立着**放, 夹爪**从侧面水平**伸过去夹套筒外圆柱面, 于是套筒轴线 == z_h。
-    这样做的两个好处:
-      1) 抓取阶段手指不用伸到台面以下, 不会撞台面;
-      2) 对准阶段只需要转动腕部让 z_h 与细杆轴线平行, 手指始终与杆轴垂直,
-         推入时手指在杆的两侧 15mm 外, 不会碰到杆。
+    套筒立着放, 夹爪从上方伸下去夹套筒的一对平面, 于是套筒轴线 == z_h(竖直)。
+    六棱柱的一对平面正对垫片, 比圆柱好夹(不会滚, 垫片面与平面全面接触)。
+    IK 里因此有一条轻量偏航偏好 + 一个偏航补偿(见 reset 里的注释):
+    5 自由度臂在"位置3+方向2"约束下解是离散的, 偏航由分支决定,
+    所以反过来把套筒绕竖轴转到"平面正对垫片"。
 
 接口 (与 so100_pick_env.py 保持同构)
     关节 6 维: [Rotation, Pitch, Elbow, Wrist_Pitch, Wrist_Roll, Jaw] (rad)
@@ -27,25 +30,45 @@
 
 运行 (自测: 随机倾角跑若干回合, 录一段视频)
     MUJOCO_GL=egl python so100_sleeve_env.py --episodes 6
-    MUJOCO_GL=egl python so100_sleeve_env.py --tilt 25 --azim 150 --episodes 3
+    MUJOCO_GL=egl python so100_sleeve_env.py --tilt 35 --azim 0 --episodes 3
+
+已固定的部署构型 (用户确认)
+    倾角方向 = 世界 +x (azim=0): 杆座放在 -x 侧(机器人右手边), 杆朝 +x(左手边)倒。
+    套筒竖直立在台面 (0.12,-0.235); 竖直夹抓只在此点附近稳。+y/-x 方向因 SO-100 仅 5 自由度、
+    工作空间偏置(基座 Rotation 关节 ±110°、竖直抓只成立在方位≈-63°)而不可达, 故锁定 +x。
+    需要临时实验其他方位仍可用 --azim 覆盖。
 
 已知限制 (实测, 待解决)
-    1) 抓取链路是稳的: 接近误差 ~4mm、夹持偏移 <2mm、夹持力 ~17N、不会滑脱。
-    2) 推入阶段目前成功率是 0: 手臂沿杆轴推套筒时, 肩/肘力矩会在 ±3.5Nm 打满,
-       同时夹爪的指侧网格会压到套筒(接触力 ~80N), 形成自锁 —— 位置控制在推不动时
-       会把力一路顶到执行器上限。控制器里已加"卡阻检测"(超前 2mm 持续 0.7s 就停),
-       不会再硬顶, 但插装本身还没成功。
-       根因: 这个 5 自由度臂在 z≈0.11 / y≈-0.19 附近已接近伸展极限, 沿 -y 方向再推
-       30~40mm 需要的力矩超出执行器预算; 而且"手在套筒正上方、手指朝下"的姿态下,
-       手自身的指侧几何离套筒表面只有亚毫米级余量。
-       可行的后续方向: (a) 把杆往机器人方向再移 1~2cm(缩短行程); (b) 给指侧网格加
-       contype/conaffinity 让指侧不参与接触(只用 pad 垫片夹持); (c) 换成"套筒先被
-       托架托着、杆沿轴线插进来"的主动对准方式, 或给臂加力控/导纳控制。
+    1) 抓取链路已经稳了: 接近误差 2.3mm、夹持偏移 <1.5mm、夹持力 ~21N(两指都压上)、
+       搬运不滑脱。偏航由 reset 里的补偿保证(平面正对垫片)。
+    2) 对准也已经很准: 套筒轴与杆轴夹角 0.7°, 横向偏心 1.3mm(内孔单边间隙 3mm)。
+       做法是"解一次终点 IK + 关节空间插值 + 短笛卡尔修正": 那条路径上逐步 IK 每步要丢
+       5~12mm(局部解不行, 重启也救不回来), 而终点本身可解。
+    3) **已做径向柔顺(等效 RCC), 楔死解决, 但插装还没完全通过**:
+       - 横向柔顺: 推入时把横向位置环闭合在"实测偏心"上(目标 = -偏心), 杆尖顶着
+         倒角产生侧向力时, 整手带着套筒往杆轴让开, 而不是让套筒在刚性垫片间楔死。
+         实测夹持力从 **455N 降到 16~32N**, 杆-套筒力从 164N 降到 **0N**(不卡了)。
+       - 姿态用夹紧持握锁住(不让套筒在爪里被顶歪), 让开完全由柔顺环负责。
+       - 杆尖加了半球: 平头杆的 90° 棱边会啃在套筒倒角锥面上, 稍有偏心就 25N 级
+         卡死; 换成球头后杆-套筒力直接归零。
+       - 卡阻判据改成看"实际重叠有没有在长"(原来用目标超前量, 臂的稳态跟踪滞后
+         就有 2mm, 会把"慢慢在进"误判成卡死)。
+       现状: 推入能连续进 9~23mm(20° 倾角下), 之后臂跟不上/轴开始漂, 停在中途。
+       剩余问题: 推入速度受臂跟踪能力限制(实际 ~0.11mm/步, 指令 0.5mm/步),
+       且深进后套筒轴线会漂(3.7°->6°)。后续: (a) 把对准残差从 3.3mm 再压小;
+       (b) 推入速度自适应(按实测跟踪速率调 insert_speed); (c) 杆再短一点/倾角再小
+       一点, 让整段行程落在臂最舒服的区间。
+    4) 倾角大的杆(>35°)对准更差: 手腕重构型行程不够, 和上面同源。
+    5) 接触分组上, 只让夹爪的 8 个垫片与套筒接触(指侧碰撞体与套筒不碰):
+       六棱柱对边 26mm 与指侧几何只剩亚毫米余量, 不分组的话下降时几十牛的侧向力
+       会把套筒推歪。代价是臂的指侧可以"穿过"套筒(视觉上不真实, 功能上无碍)。
 """
 
 from __future__ import annotations
 
 import argparse
+import math
+import sys
 from pathlib import Path
 
 import mujoco
@@ -53,38 +76,46 @@ import numpy as np
 
 from video_utils import write_video_h264
 
+_DBG_IK = False  # 临时诊断: 打印 ik_restart 返回的轴夹角
+
 SCENE_PATH = Path(__file__).resolve().parent / "task" / "so100_sleeve_scene.xml"
 
 ARM_JOINTS = ["Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll"]
 ALL_JOINTS = ARM_JOINTS + ["Jaw"]
 
 # ---------------------------------------------------------------- 场景常量 (与 XML 一致)
-TABLE_TOP = 0.04  # 台面高度(由可达性决定, 见 XML 注释)
-SLEEVE_R_OUT = 0.015  # 外半径 15mm
-SLEEVE_R_IN = 0.008  # 内孔半径 8mm
+Z_AXIS = np.array([0.0, 0.0, 1.0])
+X_AXIS = np.array([1.0, 0.0, 0.0])  # 竖立套筒的夹紧方向(对准一对平面)
+TABLE_TOP = 0.08  # (验证用) 台面顶面高度: 降到 0.08 看预插点能否落进臂展
+SLEEVE_AF = 0.026  # 六棱柱对边距离 26mm(夹爪要夹的两个平面之间的距离)
+SLEEVE_R_CIRC = SLEEVE_AF / (2 * math.cos(math.radians(30)))  # 外接圆半径 15mm
+SLEEVE_R_IN = 0.008  # 内孔内切半径 8mm
 SLEEVE_LEN = 0.060  # 长 60mm
-# 套筒**横躺**在 V 型托架上(轴线沿 ±y), 中心高度 0.110; 夹起后抬到 0.125 = 细杆轴线高度。
-# 为什么横躺: 立着的 32g/60mm 套筒中段被垫片一推就会倒(临界力 ~0.13N), 躺着则由托架约束住。
-# 为什么是 0.110: "手指朝下"姿态族的可达上限约 z=0.13, 而指尖比夹持中心低 55mm。
-SLEEVE_HOME = np.array([0.000, -0.186, 0.110])
-SLEEVE_AXIS = np.array([0.0, -1.0, 0.0])  # 套筒横躺时的轴线方向(手部 z_h 要对上它)
+# 套筒**竖直立在台面上**(台面 0.08 -> 中心 0.11)。六棱柱端面是平的所以立得稳。
+SLEEVE_HOME = np.array([0.120, -0.235, 0.110])  # 六棱柱竖直立在台面上(台面 0.08 -> 中心 0.11); 抓取只在此点附近稳
+SLEEVE_AXIS = Z_AXIS.copy()  # 套筒轴线 = 竖直(手部 z_h 要对上它)
 
-# 细杆从后方立柱水平伸出指向机器人: 局部 +z = 杆轴(基准方向 +y), 杆尖在局部 z=0.08
-ROD_BASE = np.array([0.000, -0.300, 0.113])
-ROD_REF_AXIS = np.array([0.0, 1.0, 0.0])  # 倾角 0 时的杆轴方向
-ROD_R = 0.005  # 半径 5mm
+# 细杆: 自由体, 斜向上松卡在 V 型托座里。ROD_HOME 是杆的**下端**(= 托座原点),
+# 托座/杆的朝向由倾角(相对竖直)+方位决定。
+ROD_HOME = np.array([-0.040, -0.235, 0.085])  # 杆座: 与套筒同 y, x 取负(-x=机器人右手边), 朝 +x(左手边)倒(azim=0)
+ROD_REF_AXIS = Z_AXIS.copy()  # 倾角 0 = 竖直向上
+ROD_R = 0.004  # 半径 4mm(原 5mm: 减径使内孔单边间隙 3mm->4mm, 容下高预插点臂下垂的 ~2.6mm 偏心)
 ROD_LEN = 0.080  # 露出 8cm(杆尖 y=-0.22: 让整个插装行程都落在臂展内)
 
 # ---------------------------------------------------------------- 任务参数
-INSERT_SUCCESS = 0.030  # 杆插入内孔 >= 30mm 记为成功
-INSERT_TARGET = 0.042  # 脚本演示推到此深度后停止
+INSERT_SUCCESS = 0.030  # 杆插入内孔 >= 30mm(套筒套过半)记为成功
+INSERT_TARGET = 0.034  # 脚本演示推到此深度后停止(SO-100 臂展上限下稳定可达, 高倾角约 32-35mm)
 ALIGN_TOL_DEG = 8.0  # 轴线夹角容差
-LATERAL_TOL = (SLEEVE_R_IN - ROD_R) * 0.8  # 两轴线间距容差 = 2.4mm
+LATERAL_TOL = (SLEEVE_R_IN - ROD_R) * 1.0  # 两轴线间距容差 = 3mm(=内孔-杆半径间隙, 干净插入的上限)
 
-HOVER_DZ = 0.0  # 起始悬停高度(该姿态族抬不高, 直接同高接近)
-HOVER_BACK = 0.028  # 悬停在套筒**后方**(+y 方向)2.8cm, 沿套筒轴线水平接近
-LIFT_DZ = 0.003  # 不需要抬起: 套筒与细杆同轴同高, 顺着轴线滑过去即可
-PRE_INSERT_GAP = 0.012  # 对准时套筒端面离杆尖 12mm
+# IK 多起点重启用的随机数发生器: 固定种子 -> 每步重启用的是同一段候选序列, 结果确定。
+# 不固定的话每步 default_rng() 会偶发跳到错分支, 使推入在 7mm 处非确定性卡死。
+IK_RNG = np.random.default_rng(42)
+
+HOVER_DZ = 0.055  # 悬停: 夹持中心在套筒中心正上方 5.5cm(套筒顶 0.14, 夹持中心 0.165)
+HOVER_BACK = 0.0  # 竖直下降接近, 不需要后移
+LIFT_DZ = 0.050  # 抓起后竖直抬起 5cm(该姿态族竖直方向可达)
+PRE_INSERT_GAP = 0.012  # 对准时套筒端面离杆尖 12mm(杆尖露在孔外, 对准阶段不接触)
 CLEAR_GAP = 0.030  # 粗对准点再往杆外多退 30mm(先对轴线, 再沿轴线推进)
 PRE_GRASP_OFFSET = 0.0025  # 接近套筒时手部沿夹紧方向偏置, 让固定侧垫片不蹭到套筒
 SLEEVE_JITTER_M = 0.006  # 套筒摆放位置抖动
@@ -99,18 +130,19 @@ GRIP_EXTRA_SQUEEZE = 0.001  # 若闭爪后没接触到套筒, 再多夹这么多
 # 插装时靠导入喇叭口自定心需要套筒能在爪子里轻微滑动, 所以夹持力做成柔顺的(约 5N)。
 JAW_CLOSE_LIMIT = 3.5  # 闭合阶段力矩上限(和模型默认一致): 够大才能快速闭爪
 JAW_FORCE_LIMIT = 0.40  # 夹住之后的力矩上限 -> 约 24N 夹持力(拖动套筒需要, 小了会滑脱)
+JAW_INSERT_LIMIT = 0.09  # 插装阶段的力矩上限 -> 约 5N, 柔顺以便喇叭口自定心
+LATERAL_GAIN = 1.0   # 横向柔顺增益: 目标 = -GAIN * 实测偏心(1.0 = 完全闭合到杆轴)
+LATERAL_MAX = 0.006  # 横向修正上限 6mm(留一点活动量, 又不是无限浮动)
 GRIP_FORCE_TARGET = 2.0  # 接触判据: 夹持力超过它就切到柔顺档
 
 FPS = 30
-TIMESTEP = 0.002
+TIMESTEP = 0.002  # 物理步长(与场景 XML 一致; 曾试减半配合抬 kp, 但 SO-100 模型发散)
 SUBSTEPS = int(round(1.0 / FPS / TIMESTEP))  # 17 子步 -> 34ms/步
 MAX_JOINT_STEP = 0.08  # 每控制周期关节最大变化(rad), 保证平滑
 
-Z_AXIS = np.array([0.0, 0.0, 1.0])
-
-# 抓取姿态的 IK 种子: 手指朝下、夹爪 z_h 水平(= 横躺套筒的轴线)。
-# 就是 so100_pick_env 那套"从上方抓"的姿态族, 探测确认它是本臂唯一宽可达的姿态族。
-GRASP_SEED = np.array([0.25, -1.50, 1.62, 1.45, -1.83])
+# 抓取姿态的 IK 种子: 手指水平、夹爪 z_h 竖直(= 竖立套筒的轴线)。
+# 就是 so100_pick_env 里"从上方抓"的同族构型(肘上肩下), 实测在该高度带内最好解。
+GRASP_SEED = np.array([0.28, -2.60, 2.65, -0.05, -1.57])
 
 
 # ---------------------------------------------------------------------- 小工具
@@ -131,6 +163,11 @@ def quat_align_z(axis: np.ndarray) -> np.ndarray:
     n /= np.linalg.norm(n)
     ang = float(np.arccos(np.clip(axis @ z, -1.0, 1.0)))
     return np.concatenate([[np.cos(ang / 2)], np.sin(ang / 2) * n])
+
+
+def quat_z(angle: float) -> np.ndarray:
+    """绕世界 z 轴旋转 angle(rad)的四元数。"""
+    return np.array([math.cos(angle / 2), 0.0, 0.0, math.sin(angle / 2)])
 
 
 def axis_from_tilt(tilt_deg: float, azim_deg: float,
@@ -165,6 +202,9 @@ class SO100SleeveEnv:
         self.model = mujoco.MjModel.from_xml_path(str(SCENE_PATH))
         self.data = mujoco.MjData(self.model)
         self._ik_data = mujoco.MjData(self.model)  # IK scratch, 不污染物理状态
+        # 注: 臂执行器保持 menagerie 默认(kp=50, forcerange=±3.5Nm)。曾试抬 kp / 减半 dt
+        # 压高预插点(z~0.255)的关节下垂, 但 SO-100 该模型对 kp 极敏感, 高增益在抓取/接近
+        # 接触中直接发散; 见对齐段注释走几何/柔顺路线。
 
         self.width, self.height = width, height
         self.camera = camera
@@ -189,26 +229,27 @@ class SO100SleeveEnv:
         }
 
         self.sleeve_body = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "sleeve")
-        self.rod_body = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "insert_rod")
+        # 细杆焊死在 rod_rest 上(静态 body, 没有 freejoint): 姿态只由 model.body_pos/quat 决定
+        self.rest_body = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "rod_rest")
+        self.rod_body = self.rest_body
         sj = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "sleeve_freejoint")
         self.sleeve_qadr = m.jnt_qposadr[sj]
         self.fixed_jaw_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "Fixed_Jaw")
         self.pad_f = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "fixed_jaw_pad_4")
         self.pad_m = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "moving_jaw_pad_4")
-        self.sleeve_geoms = set(
-            range(
-                mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "sleeve_wall_00"),
-                mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "sleeve_wall_15") + 1,
-            )
-        )
+        self.sleeve_geoms = {g for g in range(m.ngeom) if m.geom_bodyid[g] == self.sleeve_body}
         self.rod_geoms = {
             mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "rod_geom"),
-            mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "rod_base_geom"),
         }
         # 内孔/外圆半径 (按 16 边形内切圆, 与 XML 一致)
         self._bore_r = SLEEVE_R_IN
-        self._outer_r = SLEEVE_R_OUT
+        self._outer_r = SLEEVE_AF / 2
 
+        self._pad_geoms = [
+            mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, n)
+            for n in ("fixed_jaw_pad_1", "fixed_jaw_pad_2", "fixed_jaw_pad_3", "fixed_jaw_pad_4",
+                      "moving_jaw_pad_1", "moving_jaw_pad_2", "moving_jaw_pad_3", "moving_jaw_pad_4")
+        ]
         # 被抓住的套筒在"手部坐标"里的固定偏移/轴线 (抓取后测量), 默认按理想情况
         self.grasp_off_local = np.zeros(3)
         self.grasp_axis_local = Z_AXIS.copy()
@@ -238,21 +279,30 @@ class SO100SleeveEnv:
 
     # ---------------------------------------------------------------- 接触分组
     def _set_contact_groups(self):
-        """套筒单独占一个 contype 位(4); 手臂的网格碰撞体只碰 1/2 位, 垫片额外碰 4 位。"""
+        """只让"垫片"和套筒接触。
+
+        menagerie 的夹爪里, 垫片是 8 个 mesh geom(fixed/moving_jaw_pad_1..4), 指侧还有
+        别的碰撞体(盒/圆柱)。六棱柱套筒对边 26mm, 指侧碰撞体离垫片面只有亚毫米余量,
+        下降时一旦蹭到就是几十牛的侧向力, 直接把套筒推歪/把臂顶开。所以把臂上除垫片外的
+        所有 geom 换成单独的 contype 位(8), 让它们不与套筒(contype=4)相碰;
+        垫片保留与套筒的接触(夹持靠它), 也与台面/细杆保持相碰。
+        """
         m = self.model
         SLEEVE_BIT = 4
+        arm_bodies = {m.jnt_bodyid[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n)]
+                      for n in ALL_JOINTS}
         for g in self.sleeve_geoms:
             m.geom_contype[g] = SLEEVE_BIT
             m.geom_conaffinity[g] = 3  # 与环境(1)和其它部件(2)相碰
         for g in range(m.ngeom):
             if g in self.sleeve_geoms:
                 continue
-            if g in (self.pad_f, self.pad_m):
+            if g in self._pad_geoms:
                 m.geom_contype[g] = 1
-                m.geom_conaffinity[g] = 7  # 垫片保留与套筒(4)的接触
-            elif m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH and m.geom_contype[g] != 0:
+                m.geom_conaffinity[g] = 7  # 垫片: 保留与套筒(4)的接触
+            elif m.geom_bodyid[g] in arm_bodies:
                 m.geom_contype[g] = 8
-                m.geom_conaffinity[g] = 3  # 网格碰撞体不再碰套筒
+                m.geom_conaffinity[g] = 3  # 臂上其它 geom 不碰套筒
 
     # ---------------------------------------------------------------- 标定
     def _calibrate_jaw(self, n: int = 81):
@@ -275,7 +325,7 @@ class SO100SleeveEnv:
 
     @property
     def jaw_grip(self) -> float:
-        return self.jaw_for_width(2 * self._outer_r - GRIP_SQUEEZE)
+        return self.jaw_for_width(2 * self._outer_r - GRIP_SQUEEZE)  # 2*outer = 对边距离
 
     def _calibrate_grip_point(self):
         """把手部"夹持中心"(两指 pad4 中点在夹紧姿态下的位置) 标定成手部局部常量。
@@ -296,16 +346,60 @@ class SO100SleeveEnv:
         return self.data.xpos[self.fixed_jaw_id] + self.jaw_rot() @ self.grip_center_local
 
     # ---------------------------------------------------------------- 细杆
-    def set_rod_pose(self, tilt_deg: float, azim_deg: float, base: np.ndarray | None = None):
-        """把手部姿态写进模型: 任意倾角, 任意方位, 底座固定在台面。"""
-        if base is not None:
-            self.model.body_pos[self.rod_body] = base
-        self.model.body_quat[self.rod_body] = quat_align_z(axis_from_tilt(tilt_deg, azim_deg))
+    def set_rod_pose(self, tilt_deg: float, azim_deg: float,
+                     base: np.ndarray | None = None, slide: float = 0.0):
+        """设置细杆(及其 V 型托座)的姿态: 任意倾角(相对竖直)/方位。
+
+        细杆是**自由体**, 所以写的是它的 qpos; 托座是静态 body, 写 model.body_pos/quat。
+        托座原点 = 细杆下端, 局部 +z = 杆轴, 局部 +y = "上"(世界 +z 投到垂直于杆轴的平面),
+        这样 V 口永远朝上, 杆靠摩擦留在里面(可以被夹爪拔出来)。
+        """
+        base = ROD_HOME if base is None else np.asarray(base, float)
+        d, up, x, q = self._tilt_frame(tilt_deg, azim_deg)
+        # 细杆与座焊死在同一静态 body 上, 只需写 body_pos/quat(杆固定不晃动)
+        self.model.body_pos[self.rest_body] = base + slide * d
+        self.model.body_quat[self.rest_body] = q
         self.tilt_deg, self.azim_deg = float(tilt_deg), float(azim_deg)
         mujoco.mj_forward(self.model, self.data)
 
+    @staticmethod
+    def _tilt_frame(tilt_deg: float, azim_deg: float):
+        """倾角(相对竖直)+方位 -> (杆轴, 上方向, 横向, 四元数)。"""
+        th, ph = math.radians(tilt_deg), math.radians(azim_deg)
+        d = np.array([math.sin(th) * math.cos(ph), math.sin(th) * math.sin(ph), math.cos(th)])
+        z = Z_AXIS
+        up = z - (z @ d) * d
+        n = np.linalg.norm(up)
+        if n < 1e-6:  # 杆竖直时退化: V 口朝哪边都行, 取 +x
+            up = X_AXIS.copy()
+        else:
+            up = up / n
+        x = np.cross(up, d)
+        M = np.eye(3)
+        M[:, 0], M[:, 1], M[:, 2] = x, up, d
+        tr = np.trace(M)
+        if tr > 0:
+            s = math.sqrt(tr + 1.0) * 2
+            q = np.array([0.25 * s, (M[2, 1] - M[1, 2]) / s,
+                          (M[0, 2] - M[2, 0]) / s, (M[1, 0] - M[0, 1]) / s])
+        else:
+            i = int(np.argmax([M[0, 0], M[1, 1], M[2, 2]]))
+            if i == 0:
+                s = math.sqrt(1.0 + M[0, 0] - M[1, 1] - M[2, 2]) * 2
+                q = np.array([(M[2, 1] - M[1, 2]) / s, 0.25 * s,
+                              (M[0, 1] + M[1, 0]) / s, (M[0, 2] + M[2, 0]) / s])
+            elif i == 1:
+                s = math.sqrt(1.0 + M[1, 1] - M[0, 0] - M[2, 2]) * 2
+                q = np.array([(M[0, 2] - M[2, 0]) / s, (M[0, 1] + M[1, 0]) / s,
+                              0.25 * s, (M[1, 2] + M[2, 1]) / s])
+            else:
+                s = math.sqrt(1.0 + M[2, 2] - M[0, 0] - M[1, 1]) * 2
+                q = np.array([(M[1, 0] - M[0, 1]) / s, (M[0, 2] + M[2, 0]) / s,
+                              (M[1, 2] + M[2, 1]) / s, 0.25 * s])
+        return d, up, x, q
+
     def rod_base(self) -> np.ndarray:
-        return self.model.body_pos[self.rod_body].copy()
+        return self.data.xpos[self.rod_body].copy()
 
     def rod_axis(self) -> np.ndarray:
         return self.data.xmat[self.rod_body].reshape(3, 3)[:, 2].copy()
@@ -441,10 +535,14 @@ class SO100SleeveEnv:
         return fmax
 
     def grip_force(self) -> float:
-        """夹爪两指作用在套筒上的接触力(N)。"""
+        """夹爪两指作用在套筒上的最大接触力(N)。
+
+        统计全部 8 个垫片: 套筒轴线只要偏 1~2 度, 就只有其中两三个垫片真的压到,
+        只看第 4 号垫片会把"已经夹住"误报成没夹住。
+        """
         fmax = 0.0
         f6 = np.zeros(6)
-        pads = {self.pad_f, self.pad_m}
+        pads = set(self._pad_geoms)
         for i in range(self.data.ncon):
             c = self.data.contact[i]
             pair = {c.geom1, c.geom2}
@@ -465,6 +563,25 @@ class SO100SleeveEnv:
         self.renderer.update_scene(self.data, camera=camera or self.camera)
         return self.renderer.render()
 
+    def render_rgbd(self, camera: str | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """渲染指定相机的 RGB 与深度(RGB-D)。
+
+        返回 (rgb, depth):
+          rgb   : (H, W, 3) uint8
+          depth : (H, W) float32, 单位米(无几何处为远平面大值)
+        深度通过 Renderer 的 enable/disable_depth_rendering 切换, 与 RGB 各渲一次。
+        """
+        cam = camera or self.camera
+        r = self.renderer
+        r.disable_depth_rendering()
+        r.update_scene(self.data, cam)
+        rgb = r.render()
+        r.enable_depth_rendering()
+        r.update_scene(self.data, cam)
+        depth = r.render()
+        r.disable_depth_rendering()
+        return rgb, depth
+
     def set_arm(self, q5: np.ndarray, jaw: float):
         for n, v in zip(ARM_JOINTS, q5):
             self.data.qpos[self.qadr[n]] = v
@@ -483,11 +600,13 @@ class SO100SleeveEnv:
 
     def reset(self, tilt_deg: float | None = None, azim_deg: float | None = None,
               sleeve_xy: np.ndarray | None = None, rng: np.random.Generator | None = None,
-              tilt_range: tuple[float, float] = (0.0, 30.0),
+              tilt_range: tuple[float, float] = (20.0, 50.0),
               azim_range: tuple[float, float] = (0.0, 360.0), settle_steps: int = 80):
-        """复位: 采样细杆倾角/方位 + 套筒摆放位置, 机械臂悬停在套筒上方。
+        """复位: 采样细杆倾角/方位(相对竖直, 斜向上) + 套筒摆放位置, 臂悬停在套筒侧上方。
 
-        倾角/方位给 None 且传了 rng 时按 range 随机; 否则用给定值(默认 20°/30°)。
+        倾角/方位给 None 且传了 rng 时按 range 随机; 否则用给定值(默认 35°/0°)。
+        方位 0 = 杆朝 +x(工作区中心/机器人左侧)内倾, 即原 270°(朝 -y 外倾)左转 90°。
+        细杆是自由体, 只写初始位姿, 之后靠 V 托座的摩擦留在原地。
         """
         mujoco.mj_resetData(self.model, self.data)
 
@@ -495,9 +614,10 @@ class SO100SleeveEnv:
             t = float(rng.uniform(*tilt_range)) if tilt_deg is None else float(tilt_deg)
             a = float(rng.uniform(*azim_range)) if azim_deg is None else float(azim_deg)
         else:
-            t = 20.0 if tilt_deg is None else float(tilt_deg)
-            a = 30.0 if azim_deg is None else float(azim_deg)
-        self.set_rod_pose(t, a, base=ROD_BASE)
+            t = 35.0 if tilt_deg is None else float(tilt_deg)
+            a = 0.0 if azim_deg is None else float(azim_deg)
+        slide = 0.0 if rng is None else float(rng.uniform(-0.015, 0.015))
+        self.set_rod_pose(t, a, slide=slide)
 
         pos = SLEEVE_HOME.copy()
         if sleeve_xy is not None:
@@ -505,13 +625,20 @@ class SO100SleeveEnv:
         elif rng is not None:
             pos[:2] += rng.uniform(-SLEEVE_JITTER_M, SLEEVE_JITTER_M, size=2)
         self.data.qpos[self.sleeve_qadr:self.sleeve_qadr + 3] = pos
-        # 躺姿四元数取模型默认值(轴线沿 ±y)
-        self.data.qpos[self.sleeve_qadr + 3:self.sleeve_qadr + 7] = self.sleeve_home_quat
+        # 竖立姿态: 四元数取单位四元数(套筒局部 +z = 世界 +z)
+        self.data.qpos[self.sleeve_qadr + 3:self.sleeve_qadr + 7] = [1.0, 0.0, 0.0, 0.0]
 
-        # 悬停: 夹持中心停在套筒后上方(+y 方向后 5.5cm, 高 1.5cm), 手部轴线 = 套筒轴线
+        # 悬停: 夹持中心停在套筒正上方, 手部轴线 = 套筒轴线(竖直)
         hover = pos + np.array([0.0, HOVER_BACK, HOVER_DZ])
-        sol = self.pose_ik(hover, SLEEVE_AXIS, q_seed=GRASP_SEED,
-                           axis_local=Z_AXIS, n_iter=400, max_step=0.05, mode="pose")
+        sol = self.ik_restart(hover, SLEEVE_AXIS, GRASP_SEED, axis_local=Z_AXIS,
+                              mode="pose", n_rand=24, max_step=0.05, n_iter=300,
+                              clamp_ref=X_AXIS, rng=IK_RNG)
+        # 偏航补偿: 5 自由度臂在"位置3+方向2"约束下解是离散的, 夹紧方向 x_h 的偏航由
+        # 分支决定(实测约 16°, 没法用软偏好细调)。六棱柱的平面必须正对垫片, 所以反过来
+        # 把套筒绕竖轴转到"平面正对夹紧方向"—— 套筒是自由体, 绕自身轴怎么转都站得稳。
+        yaw = self._clamp_yaw(sol)
+        if yaw is not None:
+            self.data.qpos[self.sleeve_qadr + 3:self.sleeve_qadr + 7] = quat_z(yaw)
         self.set_arm(sol, JAW_OPEN)
         self.grasp_off_local = np.zeros(3)
         self.grasp_axis_local = Z_AXIS.copy()
@@ -549,14 +676,14 @@ class SO100SleeveEnv:
                 q_ref: np.ndarray | None = None, n_iter: int = 120, damping: float = 0.03,
                 w_dir: float = 0.30, w_reg: float = 0.02, max_step: float = 0.12,
                 jaw: float | None = None, mode: str = "pose",
-                w_clamp: float = 1.0, w_pref: float = 0.25) -> np.ndarray:
+                w_clamp: float = 1.0, w_pref: float = 0.25,
+                clamp_ref: np.ndarray | None = None, w_yaw: float = 0.005) -> np.ndarray:
         """阻尼最小二乘 IK: 让夹持中心到达 target_pos, 同时约束手部姿态。
 
-        mode="pose"  : 位置(3) + 套筒轴线方向(2)  —— 夹持中/对准/插装用
-        mode="grasp" : 位置(3) + 夹紧方向水平(1, 强) + 套筒轴线接近竖直(1, 弱) —— 抓取前用。
-                       抓一个立着的圆柱, 物理上只要求"两指夹紧方向垂直于圆柱轴"(1 维约束),
-                       手指可以在垂直于夹紧方向的平面里任意倾斜。做成软约束后 5 个关节里
-                       留出 1 维零空间, 手臂才能做出自然伸展的姿态(硬约束时只剩折叠解)。
+        约束 = 位置(3) + 套筒轴线方向(2) + 可选的偏航偏好(1, 权重 w_yaw)。
+        clamp_ref 给的是"夹紧方向 x_h 应对准的世界方向": 六棱柱不像圆柱那样对绕自身轴
+        的偏转无所谓, 垫片必须压在一对平面上, 所以抓竖立的套筒时传 X_AXIS(套筒默认
+        朝向正好有一对平面朝 ±x)。w_clamp/w_pref 只是给旧调用留着, 两种 mode 完全一样。
 
         返回 (5,) 臂关节角。求解在 scratch data 上进行, 不影响物理状态。
 
@@ -590,21 +717,21 @@ class SO100SleeveEnv:
             Jp = jacp[:, self.arm_dofs]
             Jr = jacr[:, self.arm_dofs]
             rows, errs = [Jp], [e_pos]
-            if mode == "pose":
-                a = R @ a_local
-                e_dir = target_axis - a
-                if np.linalg.norm(e_dir) < 4e-3 and np.linalg.norm(e_pos) < 5e-5:
-                    break
-                rows.append(w_dir * (-skew(a) @ Jr))
-                errs.append(w_dir * e_dir)
-            else:  # mode == "grasp"
-                x_h = R[:, 0]  # 夹紧方向: 必须水平(垂直于套筒竖直轴)
-                rows.append(w_clamp * (skew(x_h) @ Z_AXIS) @ Jr)
-                errs.append(w_clamp * np.array([-(x_h @ Z_AXIS)]))
-                z_h = R[:, 2]  # 软偏好: 套筒轴线尽量竖直(手指尽量水平, 避免捅到台面)
-                s = 1.0 if (z_h @ Z_AXIS) >= 0 else -1.0
-                rows.append(w_pref * (-skew(z_h) @ Jr))
-                errs.append(w_pref * (s * Z_AXIS - z_h))
+            # 位置 + 套筒轴线 + 轻量的"手指朝下"偏好。
+            # 最后一项对**棱柱**很关键: 圆柱对"绕自身轴偏转"无所谓, 六棱柱的夹紧方向
+            # 必须对准一对平面(x_h 落在世界 ±x), 否则垫片会压在棱角上夹不稳。
+            a = R @ a_local
+            e_dir = target_axis - a
+            if np.linalg.norm(e_dir) < 4e-3 and np.linalg.norm(e_pos) < 5e-5:
+                break
+            rows.append(w_dir * (-skew(a) @ Jr))
+            errs.append(w_dir * e_dir)
+            if clamp_ref is not None:  # 偏航偏好: 夹紧方向对准一对平面
+                x_h = R[:, 0]
+                cr = np.asarray(clamp_ref, dtype=float)
+                cr = cr / np.linalg.norm(cr)
+                rows.append(w_yaw * (-skew(x_h) @ Jr))
+                errs.append(w_yaw * (cr - x_h))
             if q_ref is not None and w_reg > 0:
                 rows.append(w_reg * np.eye(5))
                 errs.append(w_reg * (np.asarray(q_ref, float) - q))
@@ -623,17 +750,30 @@ class SO100SleeveEnv:
         cos = float(np.clip(abs(self.tool_axis() @ np.asarray(target_axis)), 0, 1))
         return e_pos, float(np.degrees(np.arccos(cos)))
 
+    def _clamp_yaw(self, sol: np.ndarray, jaw: float | None = None) -> float | None:
+        """给定关节解, 返回夹紧方向(x_h)在水平面上的偏航角(rad); 失败返回 None。
+
+        在 scratch data 上算, 不影响物理状态。用于"把套筒绕竖轴转到平面正对垫片"。
+        """
+        d = self._ik_data
+        d.qpos[:] = self.data.qpos[:]
+        d.qpos[self.qadr["Jaw"]] = self.jaw_grip if jaw is None else jaw
+        for i, n in enumerate(ARM_JOINTS):
+            d.qpos[self.qadr[n]] = sol[i]
+        mujoco.mj_forward(self.model, d)
+        x_h = d.xmat[self.fixed_jaw_id].reshape(3, 3)[:, 0]
+        return float(math.atan2(x_h[1], x_h[0]))
+
     def pose_error(self, sol: np.ndarray, target_pos: np.ndarray,
                    target_axis: np.ndarray | None = None,
                    axis_local: np.ndarray | None = None, jaw: float | None = None,
-                   mode: str = "pose") -> float:
+                   mode: str = "pose", clamp_ref: np.ndarray | None = None) -> float:
         """评估一组关节角对位姿目标的误差(m)。
 
         在 scratch data 上算, 不影响物理状态。用于判断 IK 解是否真的到位。
 
-        评分口径必须和 IK 的约束一致: mode="pose" 是"位置 + 轴线方向",
-        mode="grasp" 是"位置 + 夹紧方向水平"(此时轴线方向只是软偏好, 不能计分, 否则
-        会选出"轴向好但位置差"的错误分支)。
+        评分口径和 IK 一致: 位置 + 0.05×轴线误差 + 0.02×偏航误差(小权重, 只用来在
+        同分时偏好"夹紧方向对准棱柱平面"的解)。
         """
         d = self._ik_data
         d.qpos[:] = self.data.qpos[:]
@@ -644,14 +784,16 @@ class SO100SleeveEnv:
         p = (d.geom_xpos[self.pad_f] + d.geom_xpos[self.pad_m]) / 2
         R = d.xmat[self.fixed_jaw_id].reshape(3, 3)
         err = float(np.linalg.norm(np.asarray(target_pos, float) - p))
-        if mode == "grasp":
-            err += 0.05 * abs(float(R[0, 2]))  # 夹紧方向必须水平
-        elif target_axis is not None:
+        if target_axis is not None:
             a_local = Z_AXIS if axis_local is None else np.asarray(axis_local, float)
             a = R @ a_local
             t = np.asarray(target_axis, float)
             t = t / np.linalg.norm(t)
             err += 0.05 * float(np.linalg.norm(t - a))
+        if clamp_ref is not None:
+            cr = np.asarray(clamp_ref, dtype=float)
+            cr = cr / np.linalg.norm(cr)
+            err += 0.02 * float(np.linalg.norm(cr - R[:, 0]))
         return err
 
     def ik_restart(self, target_pos: np.ndarray, target_axis: np.ndarray,
@@ -666,6 +808,10 @@ class SO100SleeveEnv:
         rng = rng or np.random.default_rng()
         lo_hi = np.array([self.jnt_range[n] for n in ARM_JOINTS])
         best = (1e9, np.asarray(q_seed, float).copy())
+        best_align = None  # 优先: 轴对齐且"与种子分支连续"(腕翻转最小)的对齐解
+        align_cos = math.cos(0.15)  # ~8.6° 阈值: 套筒轴对齐要好于此角才被优先选
+        axis_t = None if target_axis is None else np.asarray(target_axis, float)
+        axis_l = Z_AXIS if axis_local is None else np.asarray(axis_local, float)
         cands = [np.asarray(q_seed, float)]
         # 一半在种子附近扰动(小范围换分支), 一半在工作空间内全域撒点(大范围换分支)
         for i in range(n_rand):
@@ -676,10 +822,36 @@ class SO100SleeveEnv:
         for c in cands:
             sol = self.pose_ik(target_pos, target_axis, q_seed=c, axis_local=axis_local,
                                mode=mode, **kw)
-            e = self.pose_error(sol, target_pos, target_axis, axis_local, mode=mode)
+            e = self.pose_error(sol, target_pos, target_axis, axis_local, mode=mode,
+                                clamp_ref=kw.get("clamp_ref"))
             if e < best[0] - 1e-5:
                 best = (e, sol)
-        return best[1]
+            # 方向对齐优先: pose_error 的方向权重只有 0.05, 不足以压制"套筒竖直"这个
+            # 强吸引盆; 这里单独维护一个"轴夹角<阈值 且 误差最小"的解, 优先返回它。
+            # 若真不可达(没有任何对齐解), 退回位置最优的 best。
+            if target_axis is not None:
+                _R = self._ik_data.xmat[self.fixed_jaw_id].reshape(3, 3)
+                _a = _R @ axis_l
+                if abs(float(np.clip(_a @ axis_t, -1, 1))) > align_cos:
+                    # 选"分支连续"的对齐解: 与种子关节差最小, 避免腕大幅翻转
+                    # (误差最小的对齐解常是翻转分支, 夹爪翻面把套筒甩出爪)
+                    dq = float(np.linalg.norm(sol - np.asarray(q_seed, float)))
+                    if best_align is None or dq < best_align[2]:
+                        best_align = (e, sol, dq)
+        chosen = best_align[:2] if best_align is not None else best
+        if _DBG_IK:
+            d = self._ik_data
+            d.qpos[:] = self.data.qpos[:]
+            d.qpos[self.qadr["Jaw"]] = self.jaw_grip
+            for i, n in enumerate(ARM_JOINTS):
+                d.qpos[self.qadr[n]] = chosen[1][i]
+            mujoco.mj_forward(self.model, d)
+            _R = d.xmat[self.fixed_jaw_id].reshape(3, 3)
+            _a = _R @ axis_l
+            _ang = float(np.degrees(np.arccos(np.clip(abs(_a @ axis_t), 0, 1))))
+            sys.stderr.write(f"[ik_restart] err={chosen[0]:.4f} axis_deg={_ang:.1f} "
+                             f"n_rand={n_rand} aligned={best_align is not None}\n")
+        return chosen[1]
 
     def close(self):
         if self.renderer is not None:
@@ -688,8 +860,8 @@ class SO100SleeveEnv:
 
 # ---------------------------------------------------------------------- 脚本演示
 def run_scripted_insert(env: SO100SleeveEnv, collect_frames: bool = False, verbose: bool = False,
-                        target_overlap: float = INSERT_TARGET, force_limit: float = 18.0,
-                        insert_speed: float = 0.0012, max_insert_steps: int = 240) -> dict:
+                        target_overlap: float = INSERT_TARGET, force_limit: float = 40.0,
+                        insert_speed: float = 0.00015, max_insert_steps: int = 600) -> dict:
     """脚本化演示: 抓套筒 -> 对准细杆 -> 推入 -> 松爪 -> 退出。
 
     返回 actions/states/frames/success/success_flags/overlap 等轨迹数据。
@@ -709,29 +881,38 @@ def run_scripted_insert(env: SO100SleeveEnv, collect_frames: bool = False, verbo
         if collect_frames:
             frames.append(pre_frame)
 
-    def control_step(eq_center, target_axis, jaw, mode="pose", pre_offset=0.0):
+    def control_step(eq_center, target_axis, jaw, mode="pose", pre_offset=0.0,
+                     clamp_ref=X_AXIS, slip_rot=True):
         """一个控制周期: 让"等效套筒中心"趋近 eq_center, 套筒轴线趋近 target_axis。
 
         等效中心 = 夹持中心 + R·off, 其中 off 是"手部局部: 夹持中心 -> 套筒中心"的偏移
         (抓取前为 0)。IK 真正控制的是刚体上的夹持中心, 这里做一次坐标换算。
 
         pre_offset: 未夹住时的额外偏置, 让手部沿 +x_h(固定侧)平移。固定侧垫片内表面离夹持
-        中心恒定 14.5mm, 套筒半径 15mm, 不偏开的话垫片面会啃进套筒 0.5mm; 手整体往固定侧挪
+        中心恒定 14.5mm, 套筒对边半距 13mm, 不偏开的话垫片面会啃进套筒 0.5mm; 手整体往固定侧挪
         pre_offset 后, 垫片面就退到套筒表面之外, 接近/闭合过程中不会推着套筒走。
+        clamp_ref: 夹紧方向应对准的世界方向(六棱柱要压在一对平面上); 传 None 则不约束偏航。
         """
         nonlocal cur, sol_prev
         R = env.jaw_rot()
-        # 手握滑移反馈: 让"实测套筒"而不是"假设刚性连接的预测值"去对准
+        # 手握滑移反馈: 让"实测套筒"而不是"假设刚性连接的预测值"去对准。
+        # slip_rot=False 时只修位置不修姿态: 插装阶段套筒被杆顶歪时, 若让臂的轴线跟着
+        # 套筒歪, 就变成正反馈(越顶越歪); 关掉它, 臂的轴线钉在杆轴上, 套筒在松持的
+        # 爪里自己找正 —— 这就是 RCC 想要的行为。
         dpos, R_corr = env.grasp_slip()
+        if not slip_rot:
+            R_corr = np.eye(3)
         goal = np.asarray(eq_center, float) - R @ env.grasp_off_local - dpos + pre_offset * R[:, 0]
         axis = R_corr @ np.asarray(target_axis, float)
         # 用"上一周期的 IK 解"做种子保持分支连续(不是用被限幅后的指令, 避免滞后)
         sol = env.pose_ik(goal, axis, q_seed=sol_prev, axis_local=env.grasp_axis_local,
-                          q_ref=None, mode=mode, n_iter=150)
-        if env.pose_error(sol, goal, axis, env.grasp_axis_local, mode=mode) > 0.003:
+                          q_ref=None, mode=mode, n_iter=150, clamp_ref=clamp_ref)
+        if env.pose_error(sol, goal, axis, env.grasp_axis_local, mode=mode,
+                          clamp_ref=clamp_ref) > 0.003:
             # 局部解到不了目标(分支不对/被限位) -> 多起点重启
             sol = env.ik_restart(goal, axis, sol_prev, axis_local=env.grasp_axis_local,
-                                 mode=mode, n_rand=20, max_step=0.15, n_iter=200)
+                                 mode=mode, n_rand=60, max_step=0.15, n_iter=200,
+                                 clamp_ref=clamp_ref, rng=IK_RNG)
         sol_prev = np.asarray(sol, float).copy()
         tgt = cur.copy()
         tgt[:5] = np.clip(sol, cur[:5] - MAX_JOINT_STEP, cur[:5] + MAX_JOINT_STEP)
@@ -739,7 +920,8 @@ def run_scripted_insert(env: SO100SleeveEnv, collect_frames: bool = False, verbo
         record(tgt)
         cur[:] = tgt
 
-    def goto(eq_center, target_axis, seconds, jaw, mode="pose", pre_offset=0.0):
+    def goto(eq_center, target_axis, seconds, jaw, mode="pose", pre_offset=0.0,
+             clamp_ref=X_AXIS):
         """平滑插值: 等效中心/套筒轴从当前值过渡到目标(避免目标跳变让 IK 换分支)。"""
         n = max(1, int(seconds * FPS))
         R = env.jaw_rot()
@@ -753,7 +935,29 @@ def run_scripted_insert(env: SO100SleeveEnv, collect_frames: bool = False, verbo
         a1 = a1 if (a1 @ a0) >= 0 else -a1  # 套筒是回转体, 轴向正负等价
         for i in range(n):
             t = smoothstep((i + 1) / n)
-            control_step(c0 + (c1 - c0) * t, a0 + (a1 - a0) * t, jaw, mode, pre_offset)
+            control_step(c0 + (c1 - c0) * t, a0 + (a1 - a0) * t, jaw, mode, pre_offset,
+                         clamp_ref)
+
+    def goto_joint(q_target, seconds, jaw):
+        """关节空间平滑插值到给定构型(不做逐步 IK)。
+
+        对准阶段用: 那条路径上逐步 IK 每步丢 5mm+, 而终点可以精确解出, 所以直接插关节。
+        """
+        nonlocal cur, sol_prev
+        # 从真实关节角出发, 不用 cur(指令目标): 物理滞后使 cur 超前实际构型,
+        # 直接拿它插值会让臂"瞬移"回指令位姿, 轨迹突变把套筒甩出爪。
+        q0 = env.arm_qpos()[:5].copy()
+        q1 = np.asarray(q_target, dtype=float).copy()
+        n = max(1, int(seconds * FPS))
+        for i in range(n):
+            t = smoothstep((i + 1) / n)
+            tgt = cur.copy()
+            tgt[:5] = q0 + (q1 - q0) * t
+            tgt[5] = jaw
+            record(tgt)
+            env.step(tgt)
+            cur[:] = tgt
+        sol_prev = q1.copy()
 
     def grip(jaw_to, seconds, offset_from=0.0, force_target: float = GRIP_FORCE_TARGET):
         """闭爪(两段式): 先用大力矩快速闭合到接触, 再切小力矩做柔顺夹持。
@@ -767,20 +971,20 @@ def run_scripted_insert(env: SO100SleeveEnv, collect_frames: bool = False, verbo
         env.set_jaw_force_limit(JAW_CLOSE_LIMIT)
         for i in range(n):
             t = (i + 1) / n
-            control_step(sc_now, SLEEVE_AXIS, j0 + (jaw_to - j0) * t, "pose",
+            control_step(sc_now, SLEEVE_AXIS, j0 + (jaw_to - j0) * t, "grasp",
                          pre_offset=offset_from * (1 - t))
             if env.grip_force() > force_target:  # 已经夹到 -> 换柔顺档
                 break
         env.set_jaw_force_limit(JAW_FORCE_LIMIT)
         for _ in range(max(1, int(0.3 * FPS))):
-            control_step(sc_now, SLEEVE_AXIS, jaw_to, "pose", pre_offset=0.0)
+            control_step(sc_now, SLEEVE_AXIS, jaw_to, "grasp", pre_offset=0.0)
         cur[5] = jaw_to
 
     phases = {}
 
     # ---- 1) 沿套筒轴线水平接近夹持位(带夹紧方向偏置, 不让固定侧垫片蹭到套筒) ----
     sc, _ = env.sleeve_pose()
-    goto(sc, SLEEVE_AXIS, 1.0, JAW_OPEN, mode="pose", pre_offset=PRE_GRASP_OFFSET)
+    goto(sc, SLEEVE_AXIS, 1.0, JAW_OPEN, mode="grasp", pre_offset=PRE_GRASP_OFFSET)
     R = env.jaw_rot()
     phases["descend_gap_mm"] = float(np.linalg.norm(env.grasp_point() - sc) * 1000)
     phases["descend_finger_deg"] = float(np.degrees(np.arcsin(np.clip(env.finger_dir()[2], -1, 1))))
@@ -801,6 +1005,9 @@ def run_scripted_insert(env: SO100SleeveEnv, collect_frames: bool = False, verbo
         print(f"    夹爪={env.jaw_grip:.3f}rad(开口{2 * env._outer_r * 1000 - GRIP_SQUEEZE * 1000:.1f}mm) "
               f"夹持偏移={env.grasp_off_local.round(4)} 轴向={env.grasp_axis_local.round(3)} "
               f"夹持力={phases['grip_force_N']:.2f}N")
+        con = [(a, b, round(f, 1)) for a, b, f in env.contact_report(3, 0.5)]
+        if con:
+            print(f"          接触: {con}")
 
     # ---- 3) 抬起一点点脱离 V 托架(否则套筒被托架咬住, 轴向推不动) ----
     sc, _ = env.sleeve_pose()
@@ -808,47 +1015,85 @@ def run_scripted_insert(env: SO100SleeveEnv, collect_frames: bool = False, verbo
     phases["lift_grip_N"] = env.grip_force()
     phases["lift_slip_mm"] = float(np.linalg.norm(
         env.sleeve_pose()[0] - (env.grasp_point() + env.jaw_rot() @ env.grasp_off_local)) * 1000)
+    if verbose:
+        print(f"    抬起: 夹持力={phases['lift_grip_N']:.2f}N 握滑={phases['lift_slip_mm']:.1f}mm")
 
-    # ---- 4) 对准细杆轴线: 套筒本来就躺在细杆轴线延长线上, 只需把轴线摆正, 再沿轴滑到预插装位 ----
+    # ---- 4) 对准细杆轴线: 先竖直平移到 pre 位置(套筒轴保持竖直, 纯平移不换分支),
+    # 再在 pre 处用关节空间把轴从竖直转到 rod_axis("先移后转")。
+    # 直接笛卡尔 goto(clear/rod_axis) 会在逐帧 IK 里卡在"套筒竖直"分支(位置对、轴向错),
+    # 因为 5 自由度在该位姿下"竖直"与"倾斜"是两个离散分支; 关节空间插值在已经解出的
+    # 倾斜构型上做连续运动, 不会重新解 IK 换分支, 套筒轴就能真正转到 rod_axis。
+    # goto / ik_restart 默认 clamp_ref=X_AXIS -> 六棱柱平面始终正对垫片。对齐段加紧固夹持防滑。
     rod_axis, rod_tip = env.rod_axis(), env.rod_tip()
-    clear = rod_tip + rod_axis * (SLEEVE_LEN / 2 + CLEAR_GAP)
     pre = rod_tip + rod_axis * (SLEEVE_LEN / 2 + PRE_INSERT_GAP)
-    goto(clear, rod_axis, 1.0, env.jaw_grip)
-    goto(pre, rod_axis, 0.6, env.jaw_grip)
+    env.set_jaw_force_limit(0.8)  # 对齐段更紧的夹持, 防套筒轴向滑脱
+    # 段1: 竖直平移到 pre 位置(轴仍竖直)
+    goto(pre, SLEEVE_AXIS, 1.3, env.jaw_grip)
+    # 段2: 解出 pre 处的倾斜构型, 关节空间原地绕腕转(不重新解 IK, 不换分支)
+    q_tilt = env.ik_restart(pre, rod_axis, cur[:5], axis_local=env.grasp_axis_local,
+                            mode="pose", n_rand=800, max_step=0.06, n_iter=300,
+                            clamp_ref=X_AXIS, rng=IK_RNG)
+    goto_joint(q_tilt, 1.2, env.jaw_grip)
+    sol_prev = cur[:5].copy()
     _, sa = env.sleeve_pose()
     phases["align_axis_deg"] = float(np.degrees(np.arccos(np.clip(abs(sa @ rod_axis), 0, 1))))
     phases["pre_insert_err_mm"] = float(
         np.linalg.norm((env.grasp_point() + env.jaw_rot() @ env.grasp_off_local) - pre) * 1000)
+    phases["align_slip_mm"] = float(np.linalg.norm(
+        env.sleeve_pose()[0] - (env.grasp_point() + env.jaw_rot() @ env.grasp_off_local)) * 1000)
+    mm0 = env.insert_metrics()
+    phases["align_lateral_mm"] = float(mm0["lateral"] * 1000)
     if verbose:
-        print(f"    对准: 套筒轴与杆轴夹角={phases['align_axis_deg']:.2f}° "
-              f"预插装点残差={phases['pre_insert_err_mm']:.1f}mm")
+        print(f"    对准: 轴夹角={phases['align_axis_deg']:.2f}° 预插装残差={phases['pre_insert_err_mm']:.1f}mm "
+              f"握滑={phases['align_slip_mm']:.1f}mm 横向偏心={phases['align_lateral_mm']:.1f}mm")
 
-    # ---- 5) 沿杆轴推入(限幅推进 + 卡阻保护) ----
-    # 位置控制下如果推不动, 力会一路堆到执行器上限, 所以推进时监控: 目标超前实测超过 2mm
-    # 且持续一段时间没有进展, 就判定卡阻并停下(退开), 不再硬顶。
+    # ---- 5) 沿杆轴推入(限幅推进 + 横向柔顺 + 卡阻保护) ----
+    # 横向柔顺 = 等效 RCC(远端柔顺中心): 横向位置环不钉死目标, 而是闭合在"实测偏心"上 ——
+    # 每步量出套筒中心相对杆轴的偏心 e, 目标就往 -e 方向修。杆尖顶着喇叭口产生侧向力时,
+    # 手会带着套筒往杆轴让开(而不是把套筒楔死在刚性垫片上), 喇叭口就能自定心。
+    # 真实机器人上这一环由 RCC 被动机构或腕力传感器完成, 这里用仿真里可测的偏心等效实现。
+    # 夹紧持握(锁住套筒姿态, 不让它在爪里被顶歪), 横向让开完全由柔顺环负责 ——
+    # 整手带着套筒往杆轴偏, 而不是让套筒在爪里滑动, 这才是 RCC 的行为。
+    env.set_jaw_force_limit(0.7)  # 推入段稍紧一点: 高倾角时套筒受重力矩易在爪里转, 夹紧防漂
     steps, jammed = 0, False
     des = env.sleeve_pose()[0].copy()
     stalled = 0
+    best_overlap = -1.0
+    rod_base = env.rod_base()
     while steps < max_insert_steps:
         mm = env.insert_metrics()
         if mm["overlap"] >= target_overlap:
             break
-        if env.rod_contact_force() > force_limit:  # 只看杆-套筒, 不看夹爪夹持力
+        if env.rod_contact_force() > force_limit:  # 安全阀: 超过就停, 不再硬顶
             jammed = True
             break
         cur_c, _ = env.sleeve_pose()
+        # 实测偏心(套筒中心到杆轴的垂距向量) -> 横向修正量
+        rel = cur_c - rod_base
+        e = rel - float(rel @ rod_axis) * rod_axis
+        lateral = np.clip(-LATERAL_GAIN * e, -LATERAL_MAX, LATERAL_MAX)
         lead = float((des - cur_c) @ (-rod_axis))  # 目标领先实测多少(推进方向为正)
-        if lead < 0.002:
-            des = des - rod_axis * insert_speed
+        # 原逻辑: lead<2mm 才前进 des。但高偏心下(套筒轴偏出杆轴 2.6mm) lead 被垂直分量
+        # 污染, 误判成"滞后 2mm" -> des 冻结 -> 套筒不跟 -> 5mm 死锁。改为 des 单调前进
+        # (每步沿 -rod_axis 推 insert_speed), 由 stalled 重叠停滞判据兜底卡阻。
+        des = des - rod_axis * insert_speed
+        # 卡阻判定看"实际重叠有没有在长", 不看目标超前量: 臂的稳态跟踪滞后就有 ~2mm,
+        # 用 lead 判会把"慢慢在进"误判成卡死。
+        if mm["overlap"] > best_overlap + 5e-4:
+            best_overlap = mm["overlap"]
             stalled = 0
         else:
             stalled += 1
-            if stalled > 20:  # 约 0.7s 没推进 -> 卡阻
+            if stalled > 40:  # 约 1.3s 重叠完全没长 -> 判定卡阻
                 jammed = True
                 break
-        control_step(des, rod_axis, env.jaw_grip)
+        control_step(des + lateral, rod_axis, env.jaw_grip, slip_rot=False, clamp_ref=None)
         steps += 1
+    env.set_jaw_force_limit(JAW_FORCE_LIMIT)
     mm = env.insert_metrics()
+    phases["insert_overlap_mm"] = float(mm["overlap"] * 1000)
+    phases["insert_axis_deg"] = float(np.degrees(np.arccos(min(1.0, mm["align_cos"]))))
+    phases["insert_lateral_mm"] = float(mm["lateral"] * 1000)
     phases["insert_force_N"] = env.rod_contact_force()
     phases["grip_force_end_N"] = env.grip_force()
     if verbose:
@@ -857,7 +1102,11 @@ def run_scripted_insert(env: SO100SleeveEnv, collect_frames: bool = False, verbo
               f"偏心={mm['lateral'] * 1000:.2f}mm 杆-套筒力={phases['insert_force_N']:.2f}N "
               f"夹持力={phases['grip_force_end_N']:.2f}N {'(卡阻停止)' if jammed else ''}")
 
-    # ---- 6) 松爪 + 退开 ----
+    # ---- 6) 收尾: 成功则保持(套筒在杆上), 失败则抬起来松爪放回台面, 然后退开 ----
+    success = env.is_success()
+    if not success:
+        sc, _ = env.sleeve_pose()
+        goto(sc + [0, 0, 0.045], env.tool_axis(), 0.6, env.jaw_grip)  # 先抬起来再松爪, 免得刮到杆
     grip(JAW_OPEN, 0.6)
     env.grasp_active = False
     env.grasp_off_local = np.zeros(3)
@@ -870,7 +1119,9 @@ def run_scripted_insert(env: SO100SleeveEnv, collect_frames: bool = False, verbo
         "actions": np.array(actions, dtype=np.float32),
         "states": np.array(states, dtype=np.float32),
         "frames": frames if collect_frames else None,
-        "success": bool(env.is_success()),
+        # 用**释放前**(套筒还夹在杆上时)的判定; 不能用释放后的 is_success()——
+        # 那时套筒已脱手、从斜杆上滑脱, 度量乱掉, 永远 False。
+        "success": success,
         "success_flags": np.array(flags, dtype=bool),
         "overlap": np.array(overlaps, dtype=np.float32),
         "metrics": mm,
@@ -887,14 +1138,17 @@ def _self_test():
     ap = argparse.ArgumentParser(description="SO-100 套筒插装自测")
     ap.add_argument("--episodes", type=int, default=5)
     ap.add_argument("--tilt", type=float, default=None, help="固定倾角(度), 不给则随机 0~30")
-    ap.add_argument("--azim", type=float, default=None, help="固定方位(度), 不给则随机 0~360")
+    ap.add_argument("--azim", type=float, default=None, help="固定方位(度); 部署锁定 +x(azim=0), 不给则 azim=0")
+    ap.add_argument("--camera", type=str, default=None,
+                   help="录制相机: closeup(默认, 特写) 或 base_rgbd(机械臂根部视角, 看完整运动)")
     ap.add_argument("--sweep", action="store_true", help="对固定倾角序列做扫描")
     ap.add_argument("--no-video", action="store_true")
     args = ap.parse_args()
 
+    cam = args.camera or "closeup"
     out = Path(__file__).resolve().parent / "out"
     out.mkdir(exist_ok=True)
-    env = SO100SleeveEnv(width=448, height=448, camera="closeup")
+    env = SO100SleeveEnv(width=448, height=448, camera=cam)
     rng = np.random.default_rng(0)
 
     cases: list[tuple[float, float]] = []
@@ -906,7 +1160,7 @@ def _self_test():
         for _ in range(args.episodes):
             cases.append((
                 float(args.tilt) if args.tilt is not None else float(rng.uniform(0, 30)),
-                float(args.azim) if args.azim is not None else float(rng.uniform(0, 360)),
+                float(args.azim) if args.azim is not None else 0.0,
             ))
 
     results, frames = [], None
@@ -917,18 +1171,21 @@ def _self_test():
         results.append(demo["success"])
         if i == 0 and not args.no_video:
             frames = demo["frames"]
+        ph = demo["phases"]
         mm = demo["metrics"]
+        # 注意: demo['metrics'] 是**释放后**度量的(套筒已脱手, 数值会乱滚), 不能用来判定成败;
+        # 成败看 demo['success'](释放前在杆上还夹着时算的), 重叠/夹角/偏心也用释放前存的 phases。
         print(f"  ep{i:2d} 倾角={tilt:5.1f}° 方位={azim:5.1f}° -> "
               f"{'✅ 成功' if demo['success'] else '❌ 失败'} "
-              f"重叠={mm['overlap'] * 1000:5.1f}mm "
-              f"夹角={np.degrees(np.arccos(min(1, mm['align_cos']))):4.2f}° "
-              f"偏心={mm['lateral'] * 1000:4.2f}mm")
+              f"重叠={ph.get('insert_overlap_mm', float('nan')):5.1f}mm "
+              f"夹角={ph.get('insert_axis_deg', float('nan')):4.2f}° "
+              f"偏心={ph.get('insert_lateral_mm', float('nan')):4.2f}mm")
 
     ok = int(np.sum(results))
     print(f"\n成功率: {ok}/{len(results)} = {ok / len(results) * 100:.0f}%")
 
     if frames:
-        video = out / "sleeve_insert_test.mp4"
+        video = out / ("sleeve_insert_test.mp4" if cam == "closeup" else f"sleeve_insert_test_{cam}.mp4")
         write_video_h264(video, frames, fps=FPS)
         print(f"视频: {video} ({len(frames)} 帧, {len(frames) / FPS:.1f}s)")
         picks = [0, len(frames) // 4, int(len(frames) * 0.5), int(len(frames) * 0.75), len(frames) - 1]
