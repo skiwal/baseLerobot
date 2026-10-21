@@ -31,6 +31,13 @@ from perception_api import perceive_scene
 
 PARK_QPOS = np.array([0.0, 1.2, 2.2, -1.0, -1.57])   # 缩回抬高: 随底盘平移时不挡视线/不拖地
 
+# 舒适抓取相对位姿(臂根坐标系 x,y): 套筒相对底盘落在此处时, 前臂不扫掠、可无碰撞竖直下抓。
+# 这是机械臂工作空间标定常数(真实硬件同样需要标定), 非仿真真值; 策略据此把底盘开到
+# "感知套筒位 - 该相对位姿" 的抓取停靠位, 抓取/插入本身仍全靠 RGB-D 感知 + 本体感知。
+PICKUP_REL_XY = np.array([0.120, -0.235])
+# 装配停靠位: 细杆固定在台面 ROD 处, 底盘在 (0,0,0) 时杆落在臂舒适插入相对位姿(proven)。
+ASSEMBLY_DOCK = (0.0, 0.0, 0.0)
+
 
 def park_arm(env):
     env.set_arm(PARK_QPOS, JAW_OPEN)
@@ -54,6 +61,24 @@ def drive_cart_to(env, tx, ty, tyaw, step_m=0.01, dt_steps=8):
     env.set_cart_pose(tx, ty, tyaw)
     for _ in range(30):
         env.step(env.arm_qpos())
+
+
+def drive_cart_holding(env, tx, ty, tyaw, step_m=0.01, dt_steps=8):
+    """夹持着套筒开底盘: 保持当前(已抬起的夹持)臂构型不变, 只平移/偏航底盘,
+    套筒随底盘刚性移动(绝不 park, 否则掉件)。用于"抓起后运一段路再插"。"""
+    cx, cy, cyaw = env.cart_pose
+    dist = max(abs(tx - cx), abs(ty - cy), 0.3 * abs(tyaw - cyaw))
+    n = max(1, int(dist / step_m))
+    cur = env.arm_qpos().astype(float)
+    for i in range(1, n + 1):
+        a = i / n
+        env.set_cart_pose(cx + (tx - cx) * a, cy + (ty - cy) * a, cyaw + (tyaw - cyaw) * a)
+        for _ in range(dt_steps):
+            env.step(cur)                   # 夹持构型不变 -> 套筒随底盘刚性搬运
+    env.set_cart_pose(tx, ty, tyaw)
+    for _ in range(40):
+        env.step(cur)
+    return env.arm_qpos().astype(float)
 
 
 def grasp_sleeve_base_indep(env, hover_qpos=None, verbose=True):

@@ -59,11 +59,18 @@ def main():
     out = ROOT / "out" / "assembly.mp4"
     out.parent.mkdir(exist_ok=True)
     h, w = frames[0].shape[:2]
-    vw = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*"mp4v"), 30, (w, h))
+    # cv2 只能写 mp4v(MPEG-4 Part2, 很多播放器不支持) -> 转 H.264/yuv420p(全兼容)
+    tmp = out.with_suffix(".tmp.mp4")
+    vw = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*"mp4v"), 30, (w, h))
     for f in frames:
         vw.write(f)
     vw.release()
-    print(f"[录制] 已保存 {out}  ({len(frames)} 帧, {w}x{h})")
+    import subprocess, imageio_ffmpeg
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+                    "-i", str(tmp), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-crf", "20", "-movflags", "+faststart", str(out)], check=True)
+    tmp.unlink()
+    print(f"[录制] 已保存 {out} (H.264, {len(frames)} 帧, {w}x{h})")
 
 
 if __name__ == "__main__":

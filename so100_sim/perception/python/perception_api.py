@@ -7,6 +7,7 @@
 该过程不向抓取策略泄露任何目标位置信息。
 """
 from pathlib import Path
+import os
 import re
 import subprocess
 
@@ -21,7 +22,9 @@ BUILD = PROJ / "build" / "perceive"
 
 def perceive_scene(env, cam: str = "base_rgbd", W: int = 640, H: int = 480) -> dict:
     """渲染 RGB-D -> 背景差分 -> C 感知, 返回 {'sleeve':{pos,axis,centroid}, 'rod':{...}}。"""
-    DATA.mkdir(parents=True, exist_ok=True)
+    # 每进程独立临时目录(按 PID): 避免并行批跑时多个进程争抢同一组 rgb/depth/bg/meta/result 文件
+    D = DATA / f"proc_{os.getpid()}"
+    D.mkdir(parents=True, exist_ok=True)
 
     # 1) 含目标: RGB + 深度
     rgb, depth = env.render_rgbd(cam)
@@ -51,14 +54,14 @@ def perceive_scene(env, cam: str = "base_rgbd", W: int = 640, H: int = 480) -> d
             else:
                 f.write(arr.astype(np.uint8).tobytes())
 
-    save(DATA / "rgb.bin", rgb)
-    save(DATA / "depth.bin", depth_mm)
-    save(DATA / "bg.bin", depth_bg_mm)
+    save(D / "rgb.bin", rgb)
+    save(D / "depth.bin", depth_mm)
+    save(D / "bg.bin", depth_bg_mm)
     # 动态相机外参(pos/right/up/back) + 视场角, 支持移动底盘(相机随臂根体平移+偏航)
     cpos, cright, cup, cback = env.camera_extrinsics(cam)
     cid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_CAMERA, cam)
     fovy_deg = float(env.model.cam_fovy[cid])
-    (DATA / "meta.txt").write_text(
+    (D / "meta.txt").write_text(
         f"{W} {H} {fovy_deg:.6f}\n"
         + " ".join(f"{v:.6f}" for v in cpos) + "\n"
         + " ".join(f"{v:.6f}" for v in cright) + "\n"
@@ -68,8 +71,8 @@ def perceive_scene(env, cam: str = "base_rgbd", W: int = 640, H: int = 480) -> d
     if not BUILD.exists():
         raise RuntimeError(f"找不到 C 感知程序 {BUILD}, 请先在 perception/ 里 cmake 构建")
     proc = subprocess.run(
-        [str(BUILD), str(DATA / "rgb.bin"), str(DATA / "depth.bin"),
-         str(DATA / "bg.bin"), str(DATA / "meta.txt"), str(DATA / "result.bin")],
+        [str(BUILD), str(D / "rgb.bin"), str(D / "depth.bin"),
+         str(D / "bg.bin"), str(D / "meta.txt"), str(D / "result.bin")],
         capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError("C 感知程序失败:\n" + proc.stderr)

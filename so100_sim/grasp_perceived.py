@@ -147,7 +147,7 @@ def grasp_sleeve_perceived(env, hover_qpos=None, verbose=True):
         hover = sp + np.array([0.0, HOVER_BACK, HOVER_DZ])
         sol_h = env.ik_restart(hover, Z_AXIS, GRASP_SEED, axis_local=Z_AXIS,
                                mode="pose", n_rand=24, max_step=0.05, n_iter=300,
-                               clamp_ref=X_AXIS, rng=IK_RNG)
+                               clamp_ref=X_AXIS, rng=np.random.default_rng(0))
         hover_qpos = np.concatenate([sol_h, [JAW_OPEN]])
     env.set_arm(hover_qpos[:5], float(hover_qpos[5]))
     mujoco.mj_forward(env.model, env.data)
@@ -162,8 +162,12 @@ def grasp_sleeve_perceived(env, hover_qpos=None, verbose=True):
     c0 = env.grasp_point() + R0 @ env.grasp_off_local
     a0 = (R0 @ env.grasp_axis_local).copy()
 
-    # 1) 笛卡尔平滑接近(逐步 IK 跟踪)
-    goto_p(env, c0, a0, sp, Z_AXIS, 1.0, JAW_OPEN, cur, sol_prev,
+    # 1) 笛卡尔平滑接近: 先到"套筒正上方"高位途经点, 再竖直短下探到套筒中心。
+    #    分两段避免斜向接近时夹爪/固定垫片刮碰套筒(随机位姿下曾偶发把套筒碰移导致夹偏/夹空)。
+    above = sp + Z_AXIS * 0.05
+    goto_p(env, c0, a0, above, Z_AXIS, 0.7, JAW_OPEN, cur, sol_prev,
+           mode="grasp", pre_offset=PRE_GRASP_OFFSET)
+    goto_p(env, above, Z_AXIS, sp, Z_AXIS, 0.6, JAW_OPEN, cur, sol_prev,
            mode="grasp", pre_offset=PRE_GRASP_OFFSET)
     for _ in range(30):                               # 到位后稳定
         env.step(cur)

@@ -653,12 +653,16 @@ class SO100SleeveEnv:
     def reset(self, tilt_deg: float | None = None, azim_deg: float | None = None,
               sleeve_xy: np.ndarray | None = None, rng: np.random.Generator | None = None,
               tilt_range: tuple[float, float] = (20.0, 50.0),
-              azim_range: tuple[float, float] = (0.0, 360.0), settle_steps: int = 80):
+              azim_range: tuple[float, float] = (0.0, 360.0), settle_steps: int = 80,
+              sleeve_xy_range: tuple[tuple[float, float], tuple[float, float]] | None = None):
         """复位: 采样细杆倾角/方位(相对竖直, 斜向上) + 套筒摆放位置, 臂悬停在套筒侧上方。
 
         倾角/方位给 None 且传了 rng 时按 range 随机; 否则用给定值(默认 35°/0°)。
         方位 0 = 杆朝 +x(工作区中心/机器人左侧)内倾, 即原 270°(朝 -y 外倾)左转 90°。
         细杆是自由体, 只写初始位姿, 之后靠 V 托座的摩擦留在原地。
+
+        套筒摆放: sleeve_xy 指定/优先; 否则传了 sleeve_xy_range 时在其范围内随机(任务随机化,
+        套筒竖姿不变、位置变); 再否则传 rng 时加 SLEEVE_JITTER_M 抖动; 都不给则固定在 SLEEVE_HOME。
         """
         mujoco.mj_resetData(self.model, self.data)
 
@@ -674,6 +678,9 @@ class SO100SleeveEnv:
         pos = SLEEVE_HOME.copy()
         if sleeve_xy is not None:
             pos[:2] = np.asarray(sleeve_xy, dtype=float)
+        elif sleeve_xy_range is not None and rng is not None:
+            pos[0] = float(rng.uniform(*sleeve_xy_range[0]))
+            pos[1] = float(rng.uniform(*sleeve_xy_range[1]))
         elif rng is not None:
             pos[:2] += rng.uniform(-SLEEVE_JITTER_M, SLEEVE_JITTER_M, size=2)
         self.data.qpos[self.sleeve_qadr:self.sleeve_qadr + 3] = pos
