@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "perception" / "python"))
 
 from so100_sleeve_env import (                               # 仅导入环境类与常量(非 GT 函数)
     SO100SleeveEnv, Z_AXIS, X_AXIS, JAW_OPEN, PRE_GRASP_OFFSET, LIFT_DZ,
-    JAW_CLOSE_LIMIT, JAW_FORCE_LIMIT, GRIP_FORCE_TARGET, MAX_JOINT_STEP, FPS,
+    JAW_CLOSE_LIMIT, JAW_FORCE_LIMIT, JAW_INSERT_LIMIT, GRIP_FORCE_TARGET, MAX_JOINT_STEP, FPS,
     smoothstep, IK_RNG, HOVER_BACK, HOVER_DZ, GRASP_SEED,
     SLEEVE_LEN, PRE_INSERT_GAP, LATERAL_GAIN, LATERAL_MAX, INSERT_TARGET,
     INSERT_SUCCESS, LATERAL_TOL, ALIGN_TOL_DEG, ROD_LEN, ROD_R, SLEEVE_R_IN,
@@ -264,16 +264,21 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
     # 锁 n_rand=0(居中分支) 不翻偏心分支。夹持力限 0.7: 松一点让套筒顺杆滑入。
     # 停止判据(纯相机+本体, 零 GT): 用"感知杆(杆尖+感知轴) + 夹爪本体估计的套筒中心"自行算
     # 重叠, 重叠达标即停; 另加杆接触力超阈值(力传感器) 与重叠长时间停滞(卡死) 保护。
-    # 牢固夹持: 纯感知杆轴有 ~2.3° 误差, 松夹持会被杆沿错向顶滑脱; 牢固夹持让套筒随爪直下杆。
-    env.set_jaw_force_limit(JAW_FORCE_LIMIT)
+    # 柔顺夹持(力限 ~5N): 套筒可借喇叭口在杆端自定心、把轴对到真杆上, 从而卸掉 2.3° 偏轴造成的
+    # 斜压径向力(这是接触力高的主要来源——轴夹角而非横向偏移); 力反馈负责横向定心并防止上滑。
+    # 若用牢固夹持, 套筒轴被锁在 2.3° 偏的感知轴上, 推入必把套筒斜压在杆侧(高接触力)。
+    env.set_jaw_force_limit(JAW_INSERT_LIMIT)
     steps, jammed, stalled = 0, False, 0
     des = env.sleeve_pose()[0].copy()
     des_start = des.copy()
+    f_avg = np.zeros(3)   # 力反馈低通, 防单帧大幅修正过冲振荡
     insert_speed = 0.00015
     force_limit = 100.0   # 力传感器: 真楔死保护(正常推入接触力可能偏高, 阈值给足); 非 GT
     max_insert_steps = 800
     adv_max = 0.09       # 安全上限: 指令沿 -杆轴推进量超过此值仍没坐入即停(防过推/臂限)
     best_ov = -1.0
+    K_FORCE = 0.000008   # 力控柔顺增益(温和): 杆-套筒接触力横向分量(N) -> 横向修正(m); 仅做精细定心
+    FORCE_ON_N = 3.0     # 进入接触(有力)后才启用纯力定心, 上方自由段仍用偏心粗定心
     while steps < max_insert_steps:
         cur_c, _ = env.sleeve_pose()                      # 夹爪本体估计套筒中心(非 GT)
         # 感知重叠: 套筒中心相对感知杆的轴向投影 t, 与杆/套筒长度求交(纯感知+本体)
@@ -296,8 +301,21 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
         if advanced >= adv_max:                            # 安全上限
             break
         rel = cur_c - rod_base
-        e = rel - float(rel @ rod_axis) * rod_axis         # 横向偏心(相对杆轴)
-        lateral = np.clip(-LATERAL_GAIN * e, -LATERAL_MAX, LATERAL_MAX)
+        e = rel - float(rel @ rod_axis) * rod_axis         # 横向偏心(相对感知杆轴, 粗定心)
+        # 力控柔顺(力传感器, 非 GT): 杆-套筒接触力的横向分量反向施加 -> 把套筒推回真杆心卸径向力。
+        # 低通 f_avg 平滑, 增益温和+限幅 2mm, 防单帧过冲振荡; e 与力方向点乘自动校正符号约定。
+        fvec = env.rod_contact_force_vec()
+        f_lat = fvec - float(fvec @ rod_axis) * rod_axis
+        fn = np.linalg.norm(f_lat)
+        en = np.linalg.norm(e)
+        if fn > 1e-3 and en > 1e-4:
+            s = 1.0 if (f_lat @ (e / en)) > 0 else -1.0   # 自动校正 MuJoCo 接触力符号
+            f_avg = 0.6 * f_avg + 0.4 * f_lat              # 低通
+            eff_gain = LATERAL_GAIN if fn < FORCE_ON_N else 0.2 * LATERAL_GAIN  # 接触后弱化偏心项, 让力定心主导
+            force_lat = np.clip(-K_FORCE * s * f_avg, -0.002, 0.002)
+            lateral = np.clip(-eff_gain * e + force_lat, -LATERAL_MAX, LATERAL_MAX)
+        else:
+            lateral = np.clip(-LATERAL_GAIN * e, -LATERAL_MAX, LATERAL_MAX)
         des = des - rod_axis * insert_speed
         control_step(env, des + lateral, rod_axis, env.jaw_grip, cur, sol_prev,
                      mode="pose", pre_offset=0.0, clamp_ref=None, slip_rot=False)
@@ -335,7 +353,8 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
               f"{'(卡阻)' if jammed else ''}")
         if GT_VERIFY:
             print(f"[验证·离线GT] is_success={gt_ok}  实测重叠={gt_mm['overlap'] * 1000:.1f}mm "
-                  f"(成功阈值 {INSERT_SUCCESS * 1000:.0f}mm)  <- 仅评测, 非控制器输入")
+                  f"横向={gt_mm['lateral'] * 1000:.1f}mm 轴向={np.degrees(np.arccos(min(1, gt_mm['align_cos']))):.2f}° "
+                  f"(阈值 重叠{INSERT_SUCCESS * 1000:.0f}mm/横向{LATERAL_TOL * 1000:.0f}mm/轴向{ALIGN_TOL_DEG}°)  <- 仅评测, 非控制器输入")
     return {"success": bool(success), "jammed": jammed,
             "insert_overlap_mm": float(final_ov * 1000), "align_axis_deg": align_axis_deg,
             "advanced_mm": INSERT_TARGET * 1000}

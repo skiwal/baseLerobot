@@ -534,6 +534,23 @@ class SO100SleeveEnv:
                 fmax = max(fmax, float(np.linalg.norm(f6[:3])))
         return fmax
 
+    def rod_contact_force_vec(self) -> np.ndarray:
+        """套筒与细杆接触力的合力向量(N, 世界系) —— 用于力控柔顺插入。
+
+        对全部"套筒-细杆"接触取 3D 力并求和, 即可得到把套筒顶离杆轴的合力方向;
+        沿杆轴分解出的横向分量, 反向施加即把套筒推回杆心(力控 RCC), 从而把斜压在
+        杆侧的径向接触力卸掉、大幅降低接触力。
+        """
+        f = np.zeros(3)
+        f6 = np.zeros(6)
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            pair = {c.geom1, c.geom2}
+            if (pair & self.sleeve_geoms) and (pair & self.rod_geoms):
+                mujoco.mj_contactForce(self.model, self.data, i, f6)
+                f += f6[:3]
+        return f
+
     def grip_force(self) -> float:
         """夹爪两指作用在套筒上的最大接触力(N)。
 
