@@ -237,6 +237,52 @@ int main(int argc, char** argv) {
     if (sleeve_c == rod_c) { /* 只有一个有效连通域: 退化为全当套筒 */
         rod_c = 0;
     }
+
+    /* 杆轴精修: 圆柱表面点云直接 PCA 会把轴偏掉 ~R/长度(≈3°), 足以让插装楔死。
+       正确做法(迭代圆柱拟合): 用"点相对当前轴的垂直残差(即径向向量)整段回退到轴线",
+       再 PCA 得新轴; 深度无噪声, 迭代 1~2 次即可收敛到真轴。杆半径 4mm。 */
+    if (rod_c > 0) {
+        int n = clistsize[rod_c];
+        double* pts = malloc(sizeof(double) * 3 * n);
+        int m = 0;
+        for (int k = 0; k < n; k++) {
+            int p = clist[rod_c][k]; uint16_t dm = dep[p]; if (dm == 0) continue;
+            int u = p % W, v = p / W; double w[3]; unproject((double)u, (double)v, dm / 1000.0, w);
+            pts[m*3] = w[0]; pts[m*3+1] = w[1]; pts[m*3+2] = w[2]; m++;
+        }
+        double ax[3] = {caxis[3*rod_c], caxis[3*rod_c+1], caxis[3*rod_c+2]};
+        double ce[3] = {ccent[3*rod_c], ccent[3*rod_c+1], ccent[3*rod_c+2]};
+        double* corr = malloc(sizeof(double) * 3 * m);
+        const double R = 0.004;   /* 杆半径 */
+        for (int iter = 0; iter < 6; iter++) {
+            /* 每个表面点沿"指向相机"方向(投影到垂直轴平面)回退半径 R, 落到轴线;
+               相机只看到圆柱前半面, 单侧表面点的最佳拟合线会朝相机偏 ~R/span, 必须由此校正。 */
+            for (int i = 0; i < m; i++) {
+                double tcx = CAM_POS[0] - pts[i*3], tcy = CAM_POS[1] - pts[i*3+1], tcz = CAM_POS[2] - pts[i*3+2];
+                double t = tcx*ax[0] + tcy*ax[1] + tcz*ax[2];
+                double px = tcx - t*ax[0], py = tcy - t*ax[1], pz = tcz - t*ax[2];  /* 指向相机的垂直轴分量 */
+                double plen = sqrt(px*px + py*py + pz*pz);
+                if (plen < 1e-6) { corr[i*3]=pts[i*3]; corr[i*3+1]=pts[i*3+1]; corr[i*3+2]=pts[i*3+2]; continue; }
+                corr[i*3]   = pts[i*3]   - R * (px / plen);
+                corr[i*3+1] = pts[i*3+1] - R * (py / plen);
+                corr[i*3+2] = pts[i*3+2] - R * (pz / plen);
+            }
+            pca_axis(corr, m, ax);
+            ce[0] = ce[1] = ce[2] = 0;
+            for (int i = 0; i < m; i++) { ce[0] += corr[i*3]; ce[1] += corr[i*3+1]; ce[2] += corr[i*3+2]; }
+            ce[0] /= m; ce[1] /= m; ce[2] /= m;
+        }
+        caxis[3*rod_c] = ax[0]; caxis[3*rod_c+1] = ax[1]; caxis[3*rod_c+2] = ax[2];
+        ccent[3*rod_c] = ce[0]; ccent[3*rod_c+1] = ce[1]; ccent[3*rod_c+2] = ce[2];
+        if (getenv("ROD_DEBUG")) {
+            FILE* f = fopen("/tmp/rod_pts.txt", "w");
+            for (int i = 0; i < m; i++)
+                fprintf(f, "%f %f %f\n", pts[i*3], pts[i*3+1], pts[i*3+2]);
+            fclose(f);
+        }
+        free(pts); free(corr);
+    }
+
     double sleeve_raw[3] = {0, 0, 0};   /* PCA 原始质心(用于验证抬起高度) */
 
     /* 套筒中心精修: 竖直套筒的单目斜视使可见前表面相对真实轴线偏一个半径 R.

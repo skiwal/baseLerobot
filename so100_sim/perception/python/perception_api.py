@@ -27,15 +27,20 @@ def perceive_scene(env, cam: str = "base_rgbd", W: int = 640, H: int = 480) -> d
     rgb, depth = env.render_rgbd(cam)
     depth_mm = np.where(np.isfinite(depth), np.clip(depth * 1000.0, 0, 65535), 0).astype(np.uint16)
 
-    # 2) 背景深度: 把套筒+杆临时移远再渲染, 之后用整段 qpos 快照还原(不读 GT)
+    # 2) 背景深度: 把套筒+杆临时移远再渲染, 之后用整段 qpos 快照 + 静态托座变换还原(不读 GT)
     sl = env.sleeve_qadr
     qpos_full = env.data.qpos.copy()
+    # set_rod_pose 会改写静态 rest_body(model.body_pos/quat), 仅还原 qpos 不够 -> 一并存/还原
+    rest_pos = env.model.body_pos[env.rest_body].copy()
+    rest_quat = env.model.body_quat[env.rest_body].copy()
     env.data.qpos[sl:sl + 7] = [10.0, 10.0, 10.0, 1.0, 0.0, 0.0, 0.0]
     env.set_rod_pose(35.0, 0.0, base=np.array([10.0, 10.0, 10.0]))  # 杆移到远处
     mujoco.mj_forward(env.model, env.data)
     _, depth_bg = env.render_rgbd(cam)
     depth_bg_mm = np.where(np.isfinite(depth_bg), np.clip(depth_bg * 1000.0, 0, 65535), 0).astype(np.uint16)
-    env.data.qpos[:] = qpos_full                                # 还原场景
+    env.data.qpos[:] = qpos_full                                # 还原自由体(套筒)
+    env.model.body_pos[env.rest_body] = rest_pos                 # 还原静态托座/杆
+    env.model.body_quat[env.rest_body] = rest_quat
     mujoco.mj_forward(env.model, env.data)
 
     # 3) 写 raw 交给 C 程序
