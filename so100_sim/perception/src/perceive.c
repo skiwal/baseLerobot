@@ -15,11 +15,11 @@
 #include <math.h>
 #include <stdint.h>
 
-/* ---------------- 固定相机外参(与 XML base_rgbd 一致) ---------------- */
-static const double CAM_POS[3]   = {0.08, -0.04, 0.30};
-static const double CAM_RIGHT[3] = {-0.9796, 0.2009, 0.0};
-static const double CAM_UP[3]    = {-0.1424, -0.6943, 0.7054};
-static const double CAM_BACK[3]  = {0.1418, 0.6911, 0.7088};
+/* ---------------- 相机外参(默认与 XML base_rgbd 一致; 可由 meta.txt 动态覆盖, 支持移动底盘) ---------------- */
+static double CAM_POS[3]   = {0.08, -0.04, 0.30};
+static double CAM_RIGHT[3] = {-0.9796, 0.2009, 0.0};
+static double CAM_UP[3]    = {-0.1424, -0.6943, 0.7054};
+static double CAM_BACK[3]  = {0.1418, 0.6911, 0.7088};
 static double FOVY = 50.0 * 3.141592653589793 / 180.0;
 
 static int W = 0, H = 0;
@@ -28,7 +28,21 @@ static int W = 0, H = 0;
 static int read_meta(const char* path, int* w, int* h) {
     FILE* f = fopen(path, "r");
     if (!f) return 0;
-    if (fscanf(f, "%d %d", w, h) != 2) { fclose(f); return 0; }
+    double fovy_deg = 50.0;
+    /* 新格式: 第一行 "W H fovy_deg"(fovy 可选, 缺省 50); 兼容旧格式 "W H" */
+    if (fscanf(f, "%d %d %lf", w, h, &fovy_deg) != 3) {
+        rewind(f);
+        if (fscanf(f, "%d %d", w, h) != 2) { fclose(f); return 0; }
+    }
+    FOVY = fovy_deg * 3.141592653589793 / 180.0;
+    /* 可选的外参覆盖(动态相机): 随后 4 行各 3 个 double = CAM_POS/RIGHT/UP/BACK; 缺失则保留默认 */
+    double* vec[4] = {CAM_POS, CAM_RIGHT, CAM_UP, CAM_BACK};
+    for (int k = 0; k < 4; k++) {
+        double a, b, c;
+        if (fscanf(f, "%lf %lf %lf", &a, &b, &c) == 3) {
+            vec[k][0] = a; vec[k][1] = b; vec[k][2] = c;
+        }
+    }
     fclose(f);
     return 1;
 }

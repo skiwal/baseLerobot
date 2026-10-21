@@ -259,6 +259,19 @@ class SO100SleeveEnv:
             self.sleeve_qadr + 3:self.sleeve_qadr + 7
         ].copy()
 
+        # ---- 移动底盘(cart): 把"机械臂根体 + 根部 RGB-D 相机"整体当作一个可运动的小车 ----
+        # 输入约束: 任务感知只用 RGB-D; 但小车"自己在哪"用自身里程计(等同轮编码器)记录。
+        # 实现: 给臂根体 Base 施加 (x,y,yaw) 的平面位姿, 把 base_rgbd 相机挂到 Base 上,
+        # 这样相机随底盘平移+偏航自动随动; IK 用 MuJoCo 正运动学, 臂根一动世界系目标自动适配。
+        self.base_body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "Base")
+        self.cam_rgbd_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, "base_rgbd")
+        self._base0_pos = self.model.body_pos[self.base_body_id].copy()
+        self._base0_quat = self.model.body_quat[self.base_body_id].copy()
+        # 相机挂到臂根体: cam_pos/cam_quat 当作相对 Base 的局部位姿(初始 Base=identity, 局部==世界)
+        self.model.cam_bodyid[self.cam_rgbd_id] = self.base_body_id
+        mujoco.mj_forward(self.model, self.data)
+        self.cart_pose = np.array([0.0, 0.0, 0.0])   # 里程计: (x, y, yaw) 世界系
+
         # 夹爪关节: 摩擦损失调小(menagerie 默认 0.1Nm 会把小力矩下的夹爪锁死);
         # 力矩上限默认给"闭合档", 控制器夹住以后再切到柔顺档(见 set_jaw_force_limit)。
         self.model.dof_frictionloss[self.dofadr["Jaw"]] = 0.004
@@ -361,6 +374,28 @@ class SO100SleeveEnv:
         self.model.body_quat[self.rest_body] = q
         self.tilt_deg, self.azim_deg = float(tilt_deg), float(azim_deg)
         mujoco.mj_forward(self.model, self.data)
+
+    def set_cart_pose(self, x: float, y: float, yaw: float):
+        """设置小车(臂根体+根部相机)的平面位姿 (x, y, yaw); yaw 绕世界 z。
+
+        Base 体随之平移+偏航, 相机因挂在其上而自动随动; IK 用正运动学自动适配世界系目标。
+        cart_pose 即里程计(仿真里由指令直接记录, 等同轮编码器)。
+        """
+        self.cart_pose[:] = [float(x), float(y), float(yaw)]
+        # Base 初始为 identity, 直接以绕 z 的偏航四元数(模块 quat_z 返回 (w,x,y,z), 与 MuJoCo 一致)
+        self.model.body_quat[self.base_body_id] = quat_z(float(yaw))
+        self.model.body_pos[self.base_body_id] = [float(x), float(y), self._base0_pos[2]]
+        mujoco.mj_forward(self.model, self.data)
+
+    def camera_extrinsics(self, cam: str = "base_rgbd"):
+        """返回相机世界系外参 (pos, right, up, back), 供 perceive.c 动态反投影用。
+
+        back 指向观察者(相机看向 -back); 三者为单位正交基, 列即相机到世界的旋转。
+        """
+        cid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, cam)
+        pos = self.data.cam_xpos[cid].copy()
+        mat = self.data.cam_xmat[cid].reshape(3, 3).copy()   # 列: right, up, back(世界系)
+        return pos, mat[:, 0], mat[:, 1], mat[:, 2]
 
     @staticmethod
     def _tilt_frame(tilt_deg: float, azim_deg: float):

@@ -54,7 +54,16 @@ def perceive_scene(env, cam: str = "base_rgbd", W: int = 640, H: int = 480) -> d
     save(DATA / "rgb.bin", rgb)
     save(DATA / "depth.bin", depth_mm)
     save(DATA / "bg.bin", depth_bg_mm)
-    (DATA / "meta.txt").write_text(f"{W} {H}\n")
+    # 动态相机外参(pos/right/up/back) + 视场角, 支持移动底盘(相机随臂根体平移+偏航)
+    cpos, cright, cup, cback = env.camera_extrinsics(cam)
+    cid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_CAMERA, cam)
+    fovy_deg = float(env.model.cam_fovy[cid])
+    (DATA / "meta.txt").write_text(
+        f"{W} {H} {fovy_deg:.6f}\n"
+        + " ".join(f"{v:.6f}" for v in cpos) + "\n"
+        + " ".join(f"{v:.6f}" for v in cright) + "\n"
+        + " ".join(f"{v:.6f}" for v in cup) + "\n"
+        + " ".join(f"{v:.6f}" for v in cback) + "\n")
 
     if not BUILD.exists():
         raise RuntimeError(f"找不到 C 感知程序 {BUILD}, 请先在 perception/ 里 cmake 构建")
