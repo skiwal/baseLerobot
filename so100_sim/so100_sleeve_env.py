@@ -228,6 +228,18 @@ class SO100SleeveEnv:
             n: m.jnt_range[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in ARM_JOINTS
         }
 
+        # 调硬腕部位置增益(低层): 夹持套筒时腕部跟踪滞后/稳态下垂, 会使抬起后套筒轴偏、
+        # 开环 goto_p 对准转不到杆轴而失败。把 Wrist_Pitch/Wrist_Roll 的 kp 50->300(-kp 偏置同比例,
+        # -kv 阻尼按 sqrt 比例以保持阻尼比), 力矩范围放到 ±12 以供给更大增益所需力矩。
+        WRIST_KP, WRIST_FORCE = 300.0, 12.0
+        for _jn in ("Wrist_Pitch", "Wrist_Roll"):
+            _a = self.act[_jn]
+            _s = WRIST_KP / float(m.actuator_gainprm[_a, 0])
+            m.actuator_gainprm[_a, 0] = WRIST_KP
+            m.actuator_biasprm[_a, 1] *= _s
+            m.actuator_biasprm[_a, 2] *= float(np.sqrt(_s))
+            m.actuator_forcerange[_a] = [-WRIST_FORCE, WRIST_FORCE]
+
         self.sleeve_body = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "sleeve")
         # 细杆焊死在 rod_rest 上(静态 body, 没有 freejoint): 姿态只由 model.body_pos/quat 决定
         self.rest_body = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "rod_rest")

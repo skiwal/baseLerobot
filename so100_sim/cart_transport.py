@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "perception" / "python"))
 
-from so100_sleeve_env import SO100SleeveEnv, Z_AXIS, GRIP_FORCE_TARGET
+from so100_sleeve_env import SO100SleeveEnv, Z_AXIS, JAW_OPEN, FPS, GRIP_FORCE_TARGET
 from perception_api import perceive_scene
 from cart_assembly import (drive_cart_to, drive_cart_holding, park_arm,
                            PICKUP_REL_XY, ASSEMBLY_DOCK)
@@ -46,21 +46,14 @@ def _sleeve_xy_corrected(env):
     return sp
 
 
-def run_once(env, verbose=True):
-    # 1) 开到勘测/装配位(臂收起), 相机视野覆盖台面 -> 感知套筒(带偏差校正) + 细杆。
-    #    细杆固定不动, 就在此"无遮挡"时一次性测准(抓持套筒后臂/套筒会悬在杆附近遮挡看杆的视线)。
-    drive_cart_to(env, *ASSEMBLY_DOCK)
-    det = perceive_scene(env, "base_rgbd")
-    if "sleeve" not in det or "rod" not in det:
-        return False, "勘测位未感知到套筒/细杆"
-    sp = np.asarray(det["sleeve"]["pos"], float); sp[:2] = sp[:2] + PERCEPTION_CORR
-    rod = det["rod"]
-    rod_axis = np.asarray(rod["axis"], float); rod_axis /= np.linalg.norm(rod_axis)
-    rod_tip = np.asarray(rod["tip"], float)
-    rod_base = np.asarray(rod["base"], float)
-
-    # 2) 视觉伺服校正停靠位: dock = 校正后套筒位 - 舒适抓取相对位姿; 到位后重感知重算, 迭代收敛,
-    #    让套筒真正落到 PICKUP_REL(补偿感知偏差 -> 固定构型抓取得以对准)。
+def _pickup(env, verbose=True):
+    """勘测 + 视觉伺服停靠 + proven 抓取抬起。返回 (ok, info_or_msg)。
+    会把底盘开到"套筒舒适抓取相对位姿"(补偿感知偏差)并抓取抬起; 套筒需在台面上、相机可见。"""
+    drive_cart_to(env, *ASSEMBLY_DOCK)                 # 到勘测位(臂收起, 视野覆盖台面)
+    sp = _sleeve_xy_corrected(env)
+    if sp is None:
+        return False, "勘测位未感知到套筒"
+    # 视觉伺服校正停靠位: dock = 校正后套筒位 - 舒适抓取相对位姿, 迭代收敛
     dock = sp[:2] - PICKUP_REL_XY
     for it in range(3):
         drive_cart_to(env, float(dock[0]), float(dock[1]), 0.0)
@@ -69,31 +62,41 @@ def run_once(env, verbose=True):
             break
         nd = sp2[:2] - PICKUP_REL_XY
         if verbose:
-            print(f"[运输] 停靠校正 it{it}: 停靠位 {np.round(dock, 3)} -> {np.round(nd, 3)}")
+            print(f"[运输] 停靠校正 it{it}: {np.round(dock, 3)} -> {np.round(nd, 3)}")
         if np.linalg.norm(nd - dock) < 0.003:
             dock = nd
             break
         dock = nd
     drive_cart_to(env, float(dock[0]), float(dock[1]), 0.0)
-    if verbose:
-        print(f"[运输] 抓取停靠位 {np.round(dock, 3)} (套筒被送到舒适抓取相对位姿)")
-
-    # 3) 用 proven 固定构型抓取 + 抬起(套筒已在 proven 相对位姿, PROVEN_*_SEED 与底盘绝对位置无关)
     try:
         info = grasp_sleeve_perceived(env, verbose=verbose)
     except RuntimeError as e:
         return False, f"抓取异常: {e}"
-    # 夹持力合理区间: 过低=没夹住, 过高(数千 N)=夹偏卡到棱角/桌座
     if not (info["reached"] and 10.0 < info["grip_force"] < 600.0):
         return False, f"抓取未稳(夹持力={info['grip_force']:.1f}N)"
+    return True, info
 
-    # 4) 夹持开往装配停靠位(细杆固定); 套筒随底盘搬到 proven 插入位姿
+
+def run_once(env, verbose=True):
+    # 0) 勘测位测细杆(固定不动; 抓持套筒后臂/套筒会悬在杆附近遮挡看杆视线, 故在此无遮挡时测准)。
+    drive_cart_to(env, *ASSEMBLY_DOCK)
+    det = perceive_scene(env, "base_rgbd")
+    if "rod" not in det:
+        return False, "勘测位未感知到细杆"
+    rod = det["rod"]
+    rod_axis = np.asarray(rod["axis"], float); rod_axis /= np.linalg.norm(rod_axis)
+    rod_tip = np.asarray(rod["tip"], float)
+    rod_base = np.asarray(rod["base"], float)
+
+    # 1) 第一次抓取(套筒随机位) + 夹持搬到装配停靠位
+    ok, info = _pickup(env, verbose)
+    if not ok:
+        return False, info
     if verbose:
         print(f"[运输] 夹持套筒(力={info['grip_force']:.1f}N)开往装配位 {ASSEMBLY_DOCK} ...")
     drive_cart_holding(env, *ASSEMBLY_DOCK)
 
-    # 4b) 预纠竖直: 用夹爪本体实测套筒轴, 若抓取/搬运中倾斜则原地转回竖直。
-    #     proven 插入的段1(竖直平移到 pre)假设起始轴=Z; 套筒预倾斜会使其转不动杆轴 -> 先扶正。
+    # 2) 预纠竖直: 用夹爪本体实测套筒轴, 若搬运中倾斜则原地转回竖直(proven 插入段1 假设起始轴=Z)。
     cur = env.arm_qpos().astype(float); sol_prev = cur[:5].copy()
     sc = env.grasp_point() + env.jaw_rot() @ env.grasp_off_local
     sa = env.jaw_rot() @ env.grasp_axis_local
@@ -101,11 +104,11 @@ def run_once(env, verbose=True):
     if ang > 3.0:
         goto_p(env, sc, sa, sc, Z_AXIS, 0.8, env.jaw_grip, cur, sol_prev,
                mode="pose", pre_offset=0.0)
-        ang2 = float(np.degrees(np.arccos(np.clip(abs((env.jaw_rot() @ env.grasp_axis_local) @ Z_AXIS), 0, 1))))
         if verbose:
+            ang2 = float(np.degrees(np.arccos(np.clip(abs((env.jaw_rot() @ env.grasp_axis_local) @ Z_AXIS), 0, 1))))
             print(f"[运输] 套筒轴预纠竖直: {ang:.1f}° -> {ang2:.1f}°")
 
-    # 5+6) 插入: 用勘测位测准的杆位姿(杆固定不变; 不在此处重感知, 避免悬停套筒/臂遮挡看杆)
+    # 3) proven 插入: 用勘测位测准的杆位姿(杆固定不变)
     rinfo = insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=verbose)
     return rinfo["success"], rinfo
 

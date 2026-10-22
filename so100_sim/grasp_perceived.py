@@ -244,16 +244,25 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
     cur = env.arm_qpos().astype(float)
     sol_prev = cur[:5].copy()
 
-    # ---- 4) 对准细杆轴线: 先竖直平移到 pre(套筒轴保持竖直), 再关节空间原地绕腕转到 rod_axis ----
-    # 直接笛卡尔 goto(倾斜)会卡在"套筒竖直"分支(位置对、轴向错)换不动; 先平移后关节插值才转得动。
+    # ---- 4) 对准(关节空间): 一次性 pose_ik(从当前构型梯度下降 -> 近处解/同分支, 不会像随机重启那样
+    #     跳远分支把臂甩飞)求"套筒在杆上方 pre、轴对齐 rod_axis"的构型, 再 goto_joint 关节空间搬过去。
+    #     比开环逐步跟踪更能把轴转到杆轴(随机 held 位姿下逐步跟踪常 align 34~73°); 放慢摆臂减小惯性
+    #     甩飞。若解跳远分支(关节距过大)则回退 proven 两段式对准。 ----
     pre = rod_tip + rod_axis * (SLEEVE_LEN / 2 + PRE_INSERT_GAP)
-    # 保持牢固夹持(不拔到 0.7~0.8N): 本抓取虽已居中但仍有 ~0.7cm 偏心, 过松力限会在推入/倾斜时脱手。
-    env.set_jaw_force_limit(JAW_FORCE_LIMIT)
-    sc, _ = env.sleeve_pose()
-    goto_p(env, sc, Z_AXIS, pre, Z_AXIS, 1.3, env.jaw_grip, cur, sol_prev)   # 段1: 竖直平移
-    # 段2: 笛卡尔原地旋转对准杆轴(位置停 pre, 轴线由竖直转到 rod_axis); 跟踪式不换分支/不甩出
-    goto_p(env, pre, Z_AXIS, pre, rod_axis, 1.2, env.jaw_grip, cur, sol_prev,
-           mode="pose", pre_offset=0.0, clamp_ref=None)
+    env.set_jaw_force_limit(JAW_FORCE_LIMIT)   # 牢固夹持: 对准/推入全程不脱手
+    R = env.jaw_rot()
+    q_pre = env.pose_ik(pre - R @ env.grasp_off_local, rod_axis, q_seed=sol_prev,
+                        axis_local=env.grasp_axis_local, mode="pose",
+                        n_iter=300, max_step=0.05, clamp_ref=None)
+    if float(np.linalg.norm(q_pre - sol_prev)) > 2.5:      # 极远分支 -> 回退 proven 对准
+        if verbose:
+            print(f"[对准] IK极远分支(关节距={np.linalg.norm(q_pre - sol_prev):.2f}rad) -> 回退proven对准")
+        sc, _ = env.sleeve_pose()
+        goto_p(env, sc, Z_AXIS, pre, Z_AXIS, 1.3, env.jaw_grip, cur, sol_prev)   # 段1: 竖直平移
+        goto_p(env, pre, Z_AXIS, pre, rod_axis, 1.2, env.jaw_grip, cur, sol_prev,
+               mode="pose", pre_offset=0.0, clamp_ref=None)                     # 段2: 原地转轴
+    else:
+        goto_joint(env, q_pre, 2.5, env.jaw_grip, cur, sol_prev)   # 放慢摆臂, 减小惯性甩飞套筒
     _, sa = env.sleeve_pose()
     align_axis_deg = float(np.degrees(np.arccos(np.clip(abs(sa @ rod_axis), 0, 1))))
     if verbose:
@@ -268,9 +277,6 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
     # 锁 n_rand=0(居中分支) 不翻偏心分支。夹持力限 0.7: 松一点让套筒顺杆滑入。
     # 停止判据(纯相机+本体, 零 GT): 用"感知杆(杆尖+感知轴) + 夹爪本体估计的套筒中心"自行算
     # 重叠, 重叠达标即停; 另加杆接触力超阈值(力传感器) 与重叠长时间停滞(卡死) 保护。
-    # 柔顺夹持(力限 ~5N): 套筒可借喇叭口在杆端自定心、把轴对到真杆上, 从而卸掉 2.3° 偏轴造成的
-    # 斜压径向力(这是接触力高的主要来源——轴夹角而非横向偏移); 力反馈负责横向定心并防止上滑。
-    # 若用牢固夹持, 套筒轴被锁在 2.3° 偏的感知轴上, 推入必把套筒斜压在杆侧(高接触力)。
     env.set_jaw_force_limit(JAW_INSERT_LIMIT)
     steps, jammed, stalled = 0, False, 0
     des = env.sleeve_pose()[0].copy()
@@ -324,6 +330,7 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
         control_step(env, des + lateral, rod_axis, env.jaw_grip, cur, sol_prev,
                      mode="pose", pre_offset=0.0, clamp_ref=None, slip_rot=False)
         steps += 1
+    env.set_jaw_force_limit(JAW_FORCE_LIMIT)
     env.set_jaw_force_limit(JAW_FORCE_LIMIT)
 
     # 退出臂之前先抓一次度量(套筒尚在杆上); 之后 reset grasp_off_local/退臂会让 sleeve_pose 失真。
