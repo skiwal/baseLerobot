@@ -10,3 +10,4 @@ __pycache__/
 final_videos
 so100_sim/perception/build
 so100_sim/perception/data
+so100_sim/perception/python/data

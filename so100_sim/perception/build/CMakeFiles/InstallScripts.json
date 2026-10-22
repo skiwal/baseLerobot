@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/ubuntu/code/baseLerobot/so100_sim/perception/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
