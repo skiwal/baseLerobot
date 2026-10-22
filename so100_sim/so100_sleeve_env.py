@@ -746,9 +746,12 @@ class SO100SleeveEnv:
                 q_seed: np.ndarray | None = None, axis_local: np.ndarray | None = None,
                 q_ref: np.ndarray | None = None, n_iter: int = 120, damping: float = 0.03,
                 w_dir: float = 0.30, w_reg: float = 0.02, max_step: float = 0.12,
+                w_dir_override: float | None = None,
                 jaw: float | None = None, mode: str = "pose",
                 w_clamp: float = 1.0, w_pref: float = 0.25,
-                clamp_ref: np.ndarray | None = None, w_yaw: float = 0.005) -> np.ndarray:
+                clamp_ref: np.ndarray | None = None, w_yaw: float = 0.005,
+                n_escape: int = 0, escape_rng: np.random.Generator | None = None,
+                w_lim: float = 0.0, jlim_margin: float = 0.3) -> np.ndarray:
         """阻尼最小二乘 IK: 让夹持中心到达 target_pos, 同时约束手部姿态。
 
         约束 = 位置(3) + 套筒轴线方向(2) + 可选的偏航偏好(1, 权重 w_yaw)。
@@ -775,43 +778,67 @@ class SO100SleeveEnv:
 
         jacp = np.zeros((3, self.model.nv))
         jacr = np.zeros((3, self.model.nv))
-        for _ in range(n_iter):
-            for i, n in enumerate(ARM_JOINTS):
-                d.qpos[self.qadr[n]] = q[i]
-            mujoco.mj_forward(self.model, d)
-            p = (d.geom_xpos[self.pad_f] + d.geom_xpos[self.pad_m]) / 2
-            R = d.xmat[self.fixed_jaw_id].reshape(3, 3)
-            e_pos = target_pos - p
-            if np.linalg.norm(e_pos) < 5e-5:
-                break
-            mujoco.mj_jac(self.model, d, jacp, jacr, p, self.fixed_jaw_id)
-            Jp = jacp[:, self.arm_dofs]
-            Jr = jacr[:, self.arm_dofs]
-            rows, errs = [Jp], [e_pos]
-            # 位置 + 套筒轴线 + 轻量的"手指朝下"偏好。
-            # 最后一项对**棱柱**很关键: 圆柱对"绕自身轴偏转"无所谓, 六棱柱的夹紧方向
-            # 必须对准一对平面(x_h 落在世界 ±x), 否则垫片会压在棱角上夹不稳。
-            a = R @ a_local
-            e_dir = target_axis - a
-            if np.linalg.norm(e_dir) < 4e-3 and np.linalg.norm(e_pos) < 5e-5:
-                break
-            rows.append(w_dir * (-skew(a) @ Jr))
-            errs.append(w_dir * e_dir)
-            if clamp_ref is not None:  # 偏航偏好: 夹紧方向对准一对平面
-                x_h = R[:, 0]
-                cr = np.asarray(clamp_ref, dtype=float)
-                cr = cr / np.linalg.norm(cr)
-                rows.append(w_yaw * (-skew(x_h) @ Jr))
-                errs.append(w_yaw * (cr - x_h))
-            if q_ref is not None and w_reg > 0:
-                rows.append(w_reg * np.eye(5))
-                errs.append(w_reg * (np.asarray(q_ref, float) - q))
-            A = np.vstack(rows)
-            b = np.concatenate(errs)
-            dq = A.T @ np.linalg.solve(A @ A.T + damping**2 * np.eye(A.shape[0]), b)
-            dq = np.clip(dq, -max_step, max_step)
-            q = np.clip(q + dq, lo_hi[:, 0], lo_hi[:, 1])
-        return q
+        def _solve(q0):
+            q = np.array(q0, dtype=float)
+            for _ in range(n_iter):
+                for i, n in enumerate(ARM_JOINTS):
+                    d.qpos[self.qadr[n]] = q[i]
+                mujoco.mj_forward(self.model, d)
+                p = (d.geom_xpos[self.pad_f] + d.geom_xpos[self.pad_m]) / 2
+                R = d.xmat[self.fixed_jaw_id].reshape(3, 3)
+                e_pos = target_pos - p
+                if np.linalg.norm(e_pos) < 5e-5:
+                    break
+                mujoco.mj_jac(self.model, d, jacp, jacr, p, self.fixed_jaw_id)
+                Jp = jacp[:, self.arm_dofs]
+                Jr = jacr[:, self.arm_dofs]
+                rows, errs = [Jp], [e_pos]
+                # 位置 + 套筒轴线 + 轻量的"手指朝下"偏好。
+                # 最后一项对**棱柱**很关键: 圆柱对"绕自身轴偏转"无所谓, 六棱柱的夹紧方向
+                # 必须对准一对平面(x_h 落在世界 ±x), 否则垫片会压在棱角上夹不稳。
+                a = R @ a_local
+                e_dir = target_axis - a
+                if np.linalg.norm(e_dir) < 4e-3 and np.linalg.norm(e_pos) < 5e-5:
+                    break
+                w_d = w_dir_override if w_dir_override is not None else w_dir   # 推入段可放松轴约束以避开奇异
+                rows.append(w_d * (-skew(a) @ Jr))
+                errs.append(w_d * e_dir)
+                if clamp_ref is not None:  # 偏航偏好: 夹紧方向对准一对平面
+                    x_h = R[:, 0]
+                    cr = np.asarray(clamp_ref, dtype=float)
+                    cr = cr / np.linalg.norm(cr)
+                    rows.append(w_yaw * (-skew(x_h) @ Jr))
+                    errs.append(w_yaw * (cr - x_h))
+                if q_ref is not None and w_reg > 0:
+                    rows.append(w_reg * np.eye(5))
+                    errs.append(w_reg * (np.asarray(q_ref, float) - q))
+                if w_lim > 0:   # 关节限位回避: 软约束把解推离关节限位(默认关, 仅推入启用)——
+                    q_safe = np.clip(q, lo_hi[:, 0] + jlim_margin, lo_hi[:, 1] - jlim_margin)
+                    rows.append(w_lim * np.eye(5))
+                    errs.append(w_lim * (q_safe - q))
+                A = np.vstack(rows)
+                b = np.concatenate(errs)
+                dq = A.T @ np.linalg.solve(A @ A.T + damping**2 * np.eye(A.shape[0]), b)
+                dq = np.clip(dq, -max_step, max_step)
+                q = np.clip(q + dq, lo_hi[:, 0], lo_hi[:, 1])
+            return q
+
+        best_q = _solve(q)
+        # 奇异/局部极小逃逸: 主解残留误差大(臂卡在奇异位型, 梯度≈0 推不动)时, 从扰动起点重解若干次,
+        # 取 pose_error 最小的解。仅当主解真卡住(误差>2mm)才触发, 正常步不重解(不会抖动)。
+        # 推入段传 n_escape>0 以解锁"已对准却停在杆尖上方伸不动"的卡死。
+        best_err = self.pose_error(best_q, target_pos, target_axis, axis_local, jaw=jaw,
+                                   clamp_ref=clamp_ref)
+        if n_escape > 0 and best_err > 0.002:
+            rng = escape_rng if escape_rng is not None else np.random.default_rng(0)
+            for _ in range(n_escape):
+                q0 = np.clip(q + rng.uniform(-0.8, 0.8, 5), lo_hi[:, 0], lo_hi[:, 1])
+                cand = _solve(q0)
+                err = self.pose_error(cand, target_pos, target_axis, axis_local, jaw=jaw,
+                                      clamp_ref=clamp_ref)
+                if err < best_err:
+                    best_q, best_err = cand, err
+        return best_q
 
     def ik_error(self, target_pos: np.ndarray, target_axis: np.ndarray | None = None):
         """当前抓取点到目标的距离 / 轴线夹角(度)。"""

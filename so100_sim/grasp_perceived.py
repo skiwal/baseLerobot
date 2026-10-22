@@ -38,7 +38,8 @@ PROVEN_LIFT_SEED = np.array([0.5697, -2.1175, 2.7828, -0.6256, -1.5702])
 
 # ----------------------------------------------------------------- 低层控制(仅本体传感器, 不读 GT)
 def control_step(env, eq_center, target_axis, jaw, cur, sol_prev,
-                 mode="pose", pre_offset=0.0, clamp_ref=X_AXIS, slip_rot=True):
+                 mode="pose", pre_offset=0.0, clamp_ref=X_AXIS, slip_rot=True,
+                 ik_rand=0, ik_tol=0.003, n_escape=0, w_lim=0.0, w_dir=None):
     """一个控制周期: 让等效套筒中心趋近 eq_center(=感知位姿), 轴线趋近 target_axis。"""
     R = env.jaw_rot()
     dpos, R_corr = env.grasp_slip()          # 夹持滑移反馈(接触传感器, 非目标 GT)
@@ -47,11 +48,12 @@ def control_step(env, eq_center, target_axis, jaw, cur, sol_prev,
     goal = np.asarray(eq_center, float) - R @ env.grasp_off_local - dpos + pre_offset * R[:, 0]
     axis = R_corr @ np.asarray(target_axis, float)
     sol = env.pose_ik(goal, axis, q_seed=sol_prev, axis_local=env.grasp_axis_local,
-                      q_ref=None, mode=mode, n_iter=150, clamp_ref=clamp_ref)
-    if env.pose_error(sol, goal, axis, env.grasp_axis_local, mode=mode, clamp_ref=clamp_ref) > 0.003:
-        # 回退仍锁定当前(居中)分支: n_rand=0 + 小 max_step, 否则随机重启会翻到偏心分支把套筒甩出。
+                      q_ref=None, mode=mode, n_iter=150, clamp_ref=clamp_ref,
+                      n_escape=n_escape, w_lim=w_lim, w_dir_override=w_dir)
+    if env.pose_error(sol, goal, axis, env.grasp_axis_local, mode=mode, clamp_ref=clamp_ref) > ik_tol:
+        # 回退仍锁定当前(居中)分支: n_rand=0 + 默认 tol=3mm(随机重启会翻偏心分支甩出套筒)。
         sol = env.ik_restart(goal, axis, sol_prev, axis_local=env.grasp_axis_local,
-                             mode=mode, n_rand=0, max_step=0.05, n_iter=200,
+                             mode=mode, n_rand=ik_rand, max_step=0.05, n_iter=200,
                              clamp_ref=clamp_ref, rng=IK_RNG)
     sol_prev[:] = np.asarray(sol, float)
     tgt = cur.copy()
@@ -326,11 +328,16 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
             lateral = np.clip(-eff_gain * e + force_lat, -LATERAL_MAX, LATERAL_MAX)
         else:
             lateral = np.clip(-LATERAL_GAIN * e, -LATERAL_MAX, LATERAL_MAX)
+        # 目标=指令点 des 沿 -rod_axis 推进 insert_speed; 用累积式(始终顶杆里压, 能克服接触卡滞),
+        # 而非从实测位置退一步(臂卡住时目标不前进反而停滞)。
         des = des - rod_axis * insert_speed
         control_step(env, des + lateral, rod_axis, env.jaw_grip, cur, sol_prev,
                      mode="pose", pre_offset=0.0, clamp_ref=None, slip_rot=False)
         steps += 1
-    env.set_jaw_force_limit(JAW_FORCE_LIMIT)
+        if verbose and steps % 25 == 0:
+            print(f"  [推入] s={steps} 重叠={ov*1000:5.1f} e={np.linalg.norm(e)*1000:4.1f}mm "
+                  f"力={env.rod_contact_force():.1f}N 推进={advanced*1000:.1f}mm "
+                  f"指令cur={np.round(cur[:5],3)} 实际qpos={np.round(env.arm_qpos()[:5],3)}")
     env.set_jaw_force_limit(JAW_FORCE_LIMIT)
 
     # 退出臂之前先抓一次度量(套筒尚在杆上); 之后 reset grasp_off_local/退臂会让 sleeve_pose 失真。
