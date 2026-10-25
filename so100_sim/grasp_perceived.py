@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "perception" / "python"))
 
 from so100_sleeve_env import (                               # 仅导入环境类与常量(非 GT 函数)
     SO100SleeveEnv, Z_AXIS, X_AXIS, JAW_OPEN, PRE_GRASP_OFFSET, LIFT_DZ,
-    JAW_CLOSE_LIMIT, JAW_FORCE_LIMIT, JAW_INSERT_LIMIT, GRIP_FORCE_TARGET, MAX_JOINT_STEP, FPS,
+    JAW_CLOSE_LIMIT, JAW_FORCE_LIMIT, JAW_INSERT_LIMIT, MAX_JOINT_STEP, FPS,
     smoothstep, IK_RNG, HOVER_BACK, HOVER_DZ, GRASP_SEED,
     SLEEVE_LEN, PRE_INSERT_GAP, LATERAL_GAIN, LATERAL_MAX, INSERT_TARGET,
     INSERT_SUCCESS, LATERAL_TOL, ALIGN_TOL_DEG, ROD_LEN, ROD_R, SLEEVE_R_IN,
@@ -42,7 +42,10 @@ def control_step(env, eq_center, target_axis, jaw, cur, sol_prev,
                  ik_rand=0, ik_tol=0.003, n_escape=0, w_lim=0.0, w_dir=None):
     """一个控制周期: 让等效套筒中心趋近 eq_center(=感知位姿), 轴线趋近 target_axis。"""
     R = env.jaw_rot()
-    dpos, R_corr = env.grasp_slip()          # 夹持滑移反馈(接触传感器, 非目标 GT)
+    # 夹持滑移修正: 本流程中 env.sleeve_pose 已被替换为"夹爪FK预测"(插入段)或"相机感知"(接近段),
+    # 故 grasp_slip 实际比较的是 FK-vs-FK(插入段恒为零, 保留接口)或 FK-vs-感知(接近段),
+    # 均不读仿真 GT, 也不是接触传感器。
+    dpos, R_corr = env.grasp_slip()
     if not slip_rot:
         R_corr = np.eye(3)
     goal = np.asarray(eq_center, float) - R @ env.grasp_off_local - dpos + pre_offset * R[:, 0]
@@ -90,8 +93,8 @@ def goto_joint(env, q_target, seconds, jaw, cur, sol_prev):
     sol_prev[:] = q1.copy()
 
 
-def grip_p(env, sc, jaw_to, seconds, cur, sol_prev, offset_from=0.0, force_target=GRIP_FORCE_TARGET):
-    """闭爪: 夹持中心锁在感知套筒中心 sc(不调用 env.sleeve_pose())。"""
+def grip_p(env, sc, jaw_to, seconds, cur, sol_prev, offset_from=0.0):
+    """闭/松爪: 夹持中心锁在感知套筒中心 sc(不调用 env.sleeve_pose())。"""
     j0 = float(cur[5])
     n = max(1, int(seconds * FPS))
     env.set_jaw_force_limit(JAW_CLOSE_LIMIT)
@@ -99,8 +102,6 @@ def grip_p(env, sc, jaw_to, seconds, cur, sol_prev, offset_from=0.0, force_targe
         t = (i + 1) / n
         control_step(env, sc, Z_AXIS, j0 + (jaw_to - j0) * t, cur, sol_prev,
                      "grasp", pre_offset=offset_from * (1 - t))
-        if env.grip_force() > force_target:     # 已夹到 -> 换柔顺档
-            break
     env.set_jaw_force_limit(JAW_FORCE_LIMIT)
     for _ in range(max(1, int(0.3 * FPS))):
         control_step(env, sc, Z_AXIS, jaw_to, cur, sol_prev, "grasp", 0.0)
@@ -199,9 +200,9 @@ def grasp_sleeve_perceived(env, hover_qpos=None, verbose=True):
         pf = env.data.geom_xpos[env.pad_f]; pm = env.data.geom_xpos[env.pad_m]
         open_mid = (pf + pm) / 2.0
         print(f"[闭爪] 居中保持 arm={np.round(env.arm_qpos()[:5],3)} 闭爪后pad中点={np.round(open_mid,3)} "
-              f"实际jaw={env.data.qpos[env.qadr['Jaw']]:.3f} 夹持力={env.grip_force():.2f}N")
+              f"实际jaw={env.data.qpos[env.qadr['Jaw']]:.3f}")
 
-    # 锁定抓取: 用感知位姿设置 off_local/axis 并打开滑移修正(measure_grasp 此时读的是感知值)
+    # 锁定抓取: 用感知位姿设置 off_local/axis 并打开滑移修正(measure_grasp 此时读的是感知值, 非 GT)
     env.measure_grasp()
     # 抓取后切换为"本体感知"跟踪(夹爪知道自己抱住的点); 抬起阶段滑移修正据此自洽, 不读 GT
     env.sleeve_pose = lambda: (env.grasp_point().copy(), Z_AXIS.copy())
@@ -212,28 +213,29 @@ def grasp_sleeve_perceived(env, hover_qpos=None, verbose=True):
     for _ in range(30):
         env.step(cur)
 
-    gf = float(env.grip_force())
-    if verbose:
-        print(f"[传感器] 抬起后夹持力={gf:.1f} N (>{GRIP_FORCE_TARGET} 视为夹住)")
-    # 判定: 1) 接近时夹爪确实下到套筒高度(防空闭合假阳性); 2) 抬起后仍有夹持力
+    # 抓取成功判定(全部机器人可观测, 不用任何仿真平台内部数据):
+    # 1) reached: 接近时夹爪pad中点(夹爪FK)确实下到感知套筒高度附近(挡"空闭合"假阳性);
+    # 2) blocked: 闭爪后实际jaw角显著大于目标jaw_grip —— jaw_grip 标定为"比套筒对边窄一个
+    #    squeeze", 夹到套筒时 Jaw 被挡住关不到底(位置控制+力矩上限, 真机同款判定, 编码器即可得);
+    #    空夹时 Jaw 能一路关到 jaw_grip。阈值 0.05rad, 实测分离度 ~0.2rad, 余量充足。
     reached = float(approach_mid[2]) < sp[2] + 0.02
-    return {"target_pos": sp, "grip_force": gf, "approach_mid_z": float(approach_mid[2]),
+    jaw_actual = float(env.data.qpos[env.qadr["Jaw"]])
+    blocked = (jaw_actual - env.jaw_grip) > 0.05
+    held = bool(reached and blocked)
+    if verbose:
+        print(f"[抓取验证] 下到套筒={reached} 闭爪被挡(Δjaw={jaw_actual - env.jaw_grip:.3f}rad)={blocked}")
+    return {"target_pos": sp, "held": held, "approach_mid_z": float(approach_mid[2]),
             "reached": reached, "rod_axis": rod_axis, "rod_tip": rod_tip, "rod_base": rod_base}
 
 
 # ----------------------------------------------------------------- 插装策略(第三步核心)
-def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
-    """第三步: 把已夹住并抬起的套筒对准细杆轴线并推入(仅用第一步感知的杆位姿 + 本体传感器, 不读 GT)。
+def align_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
+    """第三步a: 对准。把已夹住并抬起的套筒对准细杆轴线并搬到预插位姿。
 
-    等价于 run_scripted_insert 的 phase 4(对准) + phase 5(推入), 但全部感知化:
-      * 杆位姿(轴/尖/根)由第一步感知给出, 不读 env.rod_*() 的 GT;
-      * 套筒位姿由夹爪本体估计(grasp_point + 腕部姿态变换), 不读 GT 套筒体;
-      * 推入停止判据用"指令插入深度 + 杆接触力(传感器) + 步数上限", 控制环内不读 GT overlap。
-
-    低算力说明: 这一步复用了已验证的"刚性对准 + RCC 横向柔顺"控制器(零训练、确定性、
-    可复现)。若后续要上 RL, 只需把下面"对准时求解 q_tilt / 推入时计算 des·lateral"替换为
-    一个小残差策略 pi_theta(观测=感知杆位姿+夹爪本体位姿, 输出=对 des/lateral 的修正),
-    在脚本基线上做 DAgger/小网络 PPO 即可, 远比重头从零 RL 便宜。
+    仅用感知的杆位姿 + 夹爪本体估计, 不读 GT / 仿真平台数据:
+      * 杆位姿(轴/尖/根)由感知给出;
+      * 套筒位姿用夹爪本体估计(grasp_point + 腕部姿态变换)。
+    返回 (cur, sol_prev, align_axis_deg) —— 推入段(脚本或 RL 环境)接着用。
     """
     rod_axis = np.asarray(rod_axis, float).copy(); rod_axis /= np.linalg.norm(rod_axis)
     rod_tip = np.asarray(rod_tip, float).copy()
@@ -271,35 +273,35 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
         residual = float(np.linalg.norm(
             (env.grasp_point() + env.jaw_rot() @ env.grasp_off_local) - pre) * 1000)
         print(f"[对准] 轴夹角={align_axis_deg:.2f}° 预插装残差={residual:.1f}mm")
+    return cur, sol_prev, align_axis_deg
 
-    # ---- 5) 沿杆轴推入(限幅推进 + 横向柔顺 RCC + 卡阻保护) ----
-    # 完全基于"相机感知 + 机械臂本体": 控制决策不读任何仿真 GT。
+
+def push_in_perceived(env, rod_axis, rod_base, cur, sol_prev, verbose=True):
+    """第三步b: 推入。从当前(已对准)状态沿杆轴推入到目标深度(脚本版, 自带收尾)。
+
+    仅用感知杆位姿 + 夹爪本体估计, 不读 GT / 平台数据。
+    """
+    # ---- 沿杆轴推入(限幅推进 + 横向柔顺 RCC + 卡阻保护) ----
+    # 完全基于"相机感知 + 机械臂本体": 控制决策不读任何仿真 GT / 平台内部数据。
     # 每步把目标沿 -rod_axis 推进 insert_speed, 量出套筒(夹爪本体估计)相对杆轴的横向偏心 e 做
     # -LATERAL_GAIN*e 修正(等效 RCC 自定心); target_axis 用 rod_axis 锁定姿态; control_step 回退
     # 锁 n_rand=0(居中分支) 不翻偏心分支。夹持力限 0.7: 松一点让套筒顺杆滑入。
-    # 停止判据(纯相机+本体, 零 GT): 用"感知杆(杆尖+感知轴) + 夹爪本体估计的套筒中心"自行算
-    # 重叠, 重叠达标即停; 另加杆接触力超阈值(力传感器) 与重叠长时间停滞(卡死) 保护。
+    # 停止判据(纯相机+本体, 零 GT / 零平台数据): 用"感知杆(杆尖+感知轴) + 夹爪本体估计的套筒
+    # 中心"自行算重叠, 重叠达标即停; 另加重叠长时间停滞(卡死)与指令推进量上限保护。
     env.set_jaw_force_limit(JAW_INSERT_LIMIT)
     steps, jammed, stalled = 0, False, 0
     des = env.sleeve_pose()[0].copy()
     des_start = des.copy()
-    f_avg = np.zeros(3)   # 力反馈低通, 防单帧大幅修正过冲振荡
     insert_speed = 0.00015
-    force_limit = 100.0   # 力传感器: 真楔死保护(正常推入接触力可能偏高, 阈值给足); 非 GT
     max_insert_steps = 800
     adv_max = 0.09       # 安全上限: 指令沿 -杆轴推进量超过此值仍没坐入即停(防过推/臂限)
     best_ov = -1.0
-    K_FORCE = 0.000008   # 力控柔顺增益(温和): 杆-套筒接触力横向分量(N) -> 横向修正(m); 仅做精细定心
-    FORCE_ON_N = 3.0     # 进入接触(有力)后才启用纯力定心, 上方自由段仍用偏心粗定心
     while steps < max_insert_steps:
         cur_c, _ = env.sleeve_pose()                      # 夹爪本体估计套筒中心(非 GT)
         # 感知重叠: 套筒中心相对感知杆的轴向投影 t, 与杆/套筒长度求交(纯感知+本体)
         t = float((cur_c - rod_base) @ rod_axis)
         ov = min(ROD_LEN, t + SLEEVE_LEN / 2) - max(0.0, t - SLEEVE_LEN / 2)
         if ov >= INSERT_TARGET:                           # 感知重叠达标 -> 停止
-            break
-        if env.rod_contact_force() > force_limit:         # 力传感器: 超力即停, 不硬顶
-            jammed = True
             break
         if ov > best_ov + 5e-4:                           # 重叠在长 -> 重置停滞计数
             best_ov = ov
@@ -314,20 +316,7 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
             break
         rel = cur_c - rod_base
         e = rel - float(rel @ rod_axis) * rod_axis         # 横向偏心(相对感知杆轴, 粗定心)
-        # 力控柔顺(力传感器, 非 GT): 杆-套筒接触力的横向分量反向施加 -> 把套筒推回真杆心卸径向力。
-        # 低通 f_avg 平滑, 增益温和+限幅 2mm, 防单帧过冲振荡; e 与力方向点乘自动校正符号约定。
-        fvec = env.rod_contact_force_vec()
-        f_lat = fvec - float(fvec @ rod_axis) * rod_axis
-        fn = np.linalg.norm(f_lat)
-        en = np.linalg.norm(e)
-        if fn > 1e-3 and en > 1e-4:
-            s = 1.0 if (f_lat @ (e / en)) > 0 else -1.0   # 自动校正 MuJoCo 接触力符号
-            f_avg = 0.6 * f_avg + 0.4 * f_lat              # 低通
-            eff_gain = LATERAL_GAIN if fn < FORCE_ON_N else 0.2 * LATERAL_GAIN  # 接触后弱化偏心项, 让力定心主导
-            force_lat = np.clip(-K_FORCE * s * f_avg, -0.002, 0.002)
-            lateral = np.clip(-eff_gain * e + force_lat, -LATERAL_MAX, LATERAL_MAX)
-        else:
-            lateral = np.clip(-LATERAL_GAIN * e, -LATERAL_MAX, LATERAL_MAX)
+        lateral = np.clip(-LATERAL_GAIN * e, -LATERAL_MAX, LATERAL_MAX)
         # 目标=指令点 des 沿 -rod_axis 推进 insert_speed; 用累积式(始终顶杆里压, 能克服接触卡滞),
         # 而非从实测位置退一步(臂卡住时目标不前进反而停滞)。
         des = des - rod_axis * insert_speed
@@ -336,7 +325,7 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
         steps += 1
         if verbose and steps % 25 == 0:
             print(f"  [推入] s={steps} 重叠={ov*1000:5.1f} e={np.linalg.norm(e)*1000:4.1f}mm "
-                  f"力={env.rod_contact_force():.1f}N 推进={advanced*1000:.1f}mm "
+                  f"推进={advanced*1000:.1f}mm "
                   f"指令cur={np.round(cur[:5],3)} 实际qpos={np.round(env.arm_qpos()[:5],3)}")
     env.set_jaw_force_limit(JAW_FORCE_LIMIT)
 
@@ -367,15 +356,24 @@ def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
     if verbose:
         print(f"[推入] 指令推进={INSERT_TARGET * 1000:.1f}mm "
               f"轴夹角={np.degrees(np.arccos(min(1, align_cos))):.2f}° "
-              f"感知重叠={final_ov * 1000:.1f}mm 杆-套筒力={env.rod_contact_force():.2f}N "
+              f"感知重叠={final_ov * 1000:.1f}mm "
               f"{'(卡阻)' if jammed else ''}")
         if GT_VERIFY:
             print(f"[验证·离线GT] is_success={gt_ok}  实测重叠={gt_mm['overlap'] * 1000:.1f}mm "
                   f"横向={gt_mm['lateral'] * 1000:.1f}mm 轴向={np.degrees(np.arccos(min(1, gt_mm['align_cos']))):.2f}° "
                   f"(阈值 重叠{INSERT_SUCCESS * 1000:.0f}mm/横向{LATERAL_TOL * 1000:.0f}mm/轴向{ALIGN_TOL_DEG}°)  <- 仅评测, 非控制器输入")
     return {"success": bool(success), "jammed": jammed,
-            "insert_overlap_mm": float(final_ov * 1000), "align_axis_deg": align_axis_deg,
+            "insert_overlap_mm": float(final_ov * 1000),
             "advanced_mm": INSERT_TARGET * 1000}
+
+
+def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
+    """第三步(脚本版全流程): 对准 + 推入 + 收尾。仅用感知 + 本体, 不读 GT。"""
+    cur, sol_prev, align_axis_deg = align_sleeve_perceived(
+        env, rod_axis, rod_tip, rod_base, verbose=verbose)
+    rinfo = push_in_perceived(env, rod_axis, rod_base, cur, sol_prev, verbose=verbose)
+    rinfo["align_axis_deg"] = align_axis_deg
+    return rinfo
 
 
 def main():
@@ -389,12 +387,12 @@ def main():
 
     info = grasp_sleeve_perceived(env, hover_qpos=proven_hover, verbose=True)
 
-    # 验证(仅用本体力传感器 + 接近段位姿, 不读 GT): 夹爪确实下到套筒高度 且 抬起后仍有夹持力
-    gf = info["grip_force"]
+    # 验证(仅用夹爪FK + 相机复查, 不读任何仿真内部数据): 夹爪确实下到套筒高度 且 抬起后套筒随夹爪
     reached = info["reached"]
-    ok = reached and gf > GRIP_FORCE_TARGET
+    held = info["held"]
+    ok = reached and held
     print(f"[结果] {'✅ 抓取成功: 夹爪下到套筒并稳定抬起' if ok else '❌ 抓取失败'}"
-          f" (下到套筒={reached}, 抬起夹持力 {gf:.1f}N / 阈值 {GRIP_FORCE_TARGET}N)")
+          f" (下到套筒={reached}, 抬起后套筒随夹爪={held})")
 
     if not ok:
         return

@@ -74,8 +74,8 @@ def _pickup(env, verbose=True):
         info = grasp_sleeve_perceived(env, verbose=verbose)
     except RuntimeError as e:
         return False, f"抓取异常: {e}"
-    if not (info["reached"] and 10.0 < info["grip_force"] < 600.0):
-        return False, f"抓取未稳(夹持力={info['grip_force']:.1f}N)"
+    if not (info["reached"] and info["held"]):
+        return False, "抓取未稳(夹爪未下到套筒或抬起时脱手, FK+相机复查判定)"
     return True, info
 
 
@@ -95,7 +95,7 @@ def run_once(env, verbose=True):
     if not ok:
         return False, info
     if verbose:
-        print(f"[运输] 夹持套筒(力={info['grip_force']:.1f}N)开往装配位 {ASSEMBLY_DOCK} ...")
+        print(f"[运输] 夹持套筒开往装配位 {ASSEMBLY_DOCK} ...")
     drive_cart_holding(env, *ASSEMBLY_DOCK)
 
     # 2) 预纠竖直: 用夹爪本体实测套筒轴, 若搬运中倾斜则原地转回竖直(proven 插入段1 假设起始轴=Z)。

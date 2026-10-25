@@ -1,13 +1,58 @@
+# ============================================================
+# SO-100 套筒插装 · .gitignore
+# 原则: 只上传“源码 + 文档 + 必要配置”，排除一切靠代码可再生的
+#        大产物(数据集/模型/日志/缓存)。
+# 注意: gitignore 不支持行内注释(# 必须独占一行)。
+# ============================================================
+
+# ---------- 编辑器 / IDE / 本地工具状态 ----------
 .vscode/
-cache/
-outputs/
-so100_sim/out/
-so100_sim/*.log
+.idea/
+
+# ---------- Python 缓存 / 构建产物 ----------
 __pycache__/
-*/*.mp4
-*/*.img
-*/*.png
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---------- 日志 / 运行产物 ----------
+*.log
+cache/
+so100_sim/out/
 final_videos
+
+# ---------- 训练产物 / 模型 / 数据(大文件, 靠代码再生) ----------
+# 所有训练/在线微调产物(.pt 等)
+outputs/
+# 所有 RL 采集数据(parquet), 由 collect_rl_data.py 再生
+datasets/
+*.pt
+*.ckpt
+*.pth
+*.onnx
+
+# ---------- 数据集落盘 / 媒体(双保险) ----------
+*.parquet
+*.mp4
+*/*.mp4
+*.img
+*/*.img
+*.png
+*/*.png
+*.jpg
+*.jpeg
+
+# ---------- 第三方 / 仿真缓存 ----------
+wandb/
+runs/
+tensorboard/
 so100_sim/perception/build
 so100_sim/perception/data
 so100_sim/perception/python/data

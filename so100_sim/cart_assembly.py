@@ -143,8 +143,10 @@ def grasp_sleeve_base_indep(env, hover_qpos=None, verbose=True):
         tgt = cur.copy(); tgt[5] = j
         env.step(tgt)
     cur[5] = env.jaw_grip
+    jaw_actual = float(env.data.qpos[env.qadr["Jaw"]])
+    blocked = (jaw_actual - env.jaw_grip) > 0.05   # 被套筒挡住关不到底(真机同款判定, 编码器可得)
     if verbose:
-        print(f"[闭爪] 夹持力={env.grip_force():.2f}N")
+        print(f"[闭爪] Δjaw={jaw_actual - env.jaw_grip:.3f}rad 夹到套筒={blocked}")
 
     env.measure_grasp()
     env.sleeve_pose = lambda: (env.grasp_point().copy(), Z_AXIS.copy())
@@ -157,9 +159,9 @@ def grasp_sleeve_base_indep(env, hover_qpos=None, verbose=True):
     for _ in range(30):
         env.step(cur)
 
-    gf = float(env.grip_force())
     reached = float(approach_mid[2]) < sp[2] + 0.02
-    return {"target_pos": sp, "grip_force": gf, "approach_mid_z": float(approach_mid[2]),
+    return {"target_pos": sp, "held": bool(reached and blocked),
+            "approach_mid_z": float(approach_mid[2]),
             "reached": reached, "rod_axis": rod_axis, "rod_tip": rod_tip, "rod_base": rod_base}
 
 
@@ -203,10 +205,10 @@ def main():
             print(f"[重试{attempt}] 感知/抓取异常: {e}; 重定位后重试")
             drive_cart_to(env, *dock)
             continue
-        ok_g = info["reached"] and info["grip_force"] > GRIP_FORCE_TARGET
+        ok_g = info["reached"] and info["held"]
         if not ok_g:
             print(f"[重试{attempt}] 抓取未稳(下到套筒={info['reached']}, "
-                  f"夹持力{info['grip_force']:.1f}N); 重定位后重试")
+                  f"闭爪夹到套筒={info['held']}); 重定位后重试")
             drive_cart_to(env, *dock)
             continue
         rinfo = insert_sleeve_perceived(env, info["rod_axis"], info["rod_tip"], info["rod_base"], verbose=True)
