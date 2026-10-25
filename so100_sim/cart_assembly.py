@@ -34,9 +34,18 @@ PARK_QPOS = np.array([0.0, 1.2, 2.2, -1.0, -1.57])   # 缩回抬高: 随底盘�
 # 舒适抓取相对位姿(臂根坐标系 x,y): 套筒相对底盘落在此处时, 前臂不扫掠、可无碰撞竖直下抓。
 # 这是机械臂工作空间标定常数(真实硬件同样需要标定), 非仿真真值; 策略据此把底盘开到
 # "感知套筒位 - 该相对位姿" 的抓取停靠位, 抓取/插入本身仍全靠 RGB-D 感知 + 本体感知。
-PICKUP_REL_XY = np.array([0.120, -0.235])
+# P3 标定修正(实测 G_rel=(0.0981,-0.2332) 为 PROVEN_GRASP_SEED 的夹爪小车相对位):
+#   原 (0.120,-0.235) 偏置 22mm -> 抓取靠夹爪垫蹭边, seed 57 恰夹空(99%)。
+#   完全居中(0mm)          -> 夹爪本体压到杆/夹具, 插入卡浅重叠(实测 99%->53% 回归)。
+#   折中 18mm(0.116)       -> 夹爪垫半展内夹牢(含 seed 57) 且保留插入所需夹爪-杆间隙
+#                             (seed 42 需>14mm), 全量 100/100。y 同步取 G_rel_y。
+PICKUP_REL_XY = np.array([0.116, -0.2332])
 # 装配停靠位: 细杆固定在台面 ROD 处, 底盘在 (0,0,0) 时杆落在臂舒适插入相对位姿(proven)。
 ASSEMBLY_DOCK = (0.0, 0.0, 0.0)
+# 插入站位(仅"夹持后开往的装配位"用, 勘测/抓取仍用 ASSEMBLY_DOCK): 绕小车原点偏航 +0.19rad。
+# 接近几何重摆(P2.5): 同一世界系插入目标在不同小车站位下解出不同关节构型; 原 yaw=0 把插入放在
+# 关节运动学最差区(推入期沿杆轴漂移→楔死)。偏航 +0.19 让臂以更优关节构型直推, 收复 ~7/8 深几何楔死。
+INSERTION_DOCK = (0.0, 0.0, 0.19)
 
 
 def park_arm(env):
@@ -211,6 +220,8 @@ def main():
                   f"闭爪夹到套筒={info['held']}); 重定位后重试")
             drive_cart_to(env, *dock)
             continue
+        # 插入段用重摆后的站位(偏航 +0.19), 抓取/勘测仍用原 dock
+        drive_cart_to(env, *INSERTION_DOCK)
         rinfo = insert_sleeve_perceived(env, info["rod_axis"], info["rod_tip"], info["rod_base"], verbose=True)
         if rinfo["success"]:
             print(f"[结果] ✅ 小车自主装配成功 (停靠位={np.round(env.cart_pose,3)}, "

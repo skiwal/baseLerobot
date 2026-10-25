@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "perception" / "python"))
 from so100_sleeve_env import SO100SleeveEnv, Z_AXIS, JAW_OPEN, FPS, GRIP_FORCE_TARGET
 from perception_api import perceive_scene
 from cart_assembly import (drive_cart_to, drive_cart_holding, park_arm,
-                           PICKUP_REL_XY, ASSEMBLY_DOCK)
+                           PICKUP_REL_XY, ASSEMBLY_DOCK, INSERTION_DOCK)
 from grasp_perceived import (grasp_sleeve_perceived, insert_sleeve_perceived, goto_p)
 
 # 套筒随机放置范围(世界系 x,y): 台面盒为 x∈[-0.165,0.165], y∈[-0.28,-0.16](顶面 z=0.08);
@@ -79,10 +79,12 @@ def _pickup(env, verbose=True):
     return True, info
 
 
-def run_once(env, verbose=True):
+def run_once(env, verbose=True, insert_dock=None):
+    """insert_dock: 可选的插入站位覆盖(只改"夹持后开往的装配位", 感知勘测位仍用 ASSEMBLY_DOCK)。
+    默认 INSERTION_DOCK(偏航 +0.19): 接近几何重摆, 收复深几何楔死。"""
     # 0) 勘测位测细杆(固定不动; 抓持套筒后臂/套筒会悬在杆附近遮挡看杆视线, 故在此无遮挡时测准)。
     drive_cart_to(env, *ASSEMBLY_DOCK)
-    det = perceive_scene(env, "base_rgbd")
+    det = perceive_scene(env, "base_rgbd", expected_tilt_deg=35.0, expected_azim_deg=0.0)
     if "rod" not in det:
         return False, "勘测位未感知到细杆"
     rod = det["rod"]
@@ -94,9 +96,10 @@ def run_once(env, verbose=True):
     ok, info = _pickup(env, verbose)
     if not ok:
         return False, info
+    ins_dock = INSERTION_DOCK if insert_dock is None else insert_dock
     if verbose:
-        print(f"[运输] 夹持套筒开往装配位 {ASSEMBLY_DOCK} ...")
-    drive_cart_holding(env, *ASSEMBLY_DOCK)
+        print(f"[运输] 夹持套筒开往装配位 {np.round(ins_dock, 3)} ...")
+    drive_cart_holding(env, *ins_dock)
 
     # 2) 预纠竖直: 用夹爪本体实测套筒轴, 若搬运中倾斜则原地转回竖直(proven 插入段1 假设起始轴=Z)。
     cur = env.arm_qpos().astype(float); sol_prev = cur[:5].copy()

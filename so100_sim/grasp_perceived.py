@@ -290,6 +290,7 @@ def push_in_perceived(env, rod_axis, rod_base, cur, sol_prev, verbose=True):
     # 中心"自行算重叠, 重叠达标即停; 另加重叠长时间停滞(卡死)与指令推进量上限保护。
     env.set_jaw_force_limit(JAW_INSERT_LIMIT)
     steps, jammed, stalled = 0, False, 0
+    _rec = globals().get("_PUSH_REC", None)   # 诊断用逐步记录器(默认关, 不影响生产逻辑)
     des = env.sleeve_pose()[0].copy()
     des_start = des.copy()
     insert_speed = 0.00015
@@ -317,6 +318,8 @@ def push_in_perceived(env, rod_axis, rod_base, cur, sol_prev, verbose=True):
         rel = cur_c - rod_base
         e = rel - float(rel @ rod_axis) * rod_axis         # 横向偏心(相对感知杆轴, 粗定心)
         lateral = np.clip(-LATERAL_GAIN * e, -LATERAL_MAX, LATERAL_MAX)
+        if _rec is not None:
+            _rec.append((ov, float(np.linalg.norm(e)), advanced, stalled, jammed))
         # 目标=指令点 des 沿 -rod_axis 推进 insert_speed; 用累积式(始终顶杆里压, 能克服接触卡滞),
         # 而非从实测位置退一步(臂卡住时目标不前进反而停滞)。
         des = des - rod_axis * insert_speed
@@ -342,17 +345,6 @@ def push_in_perceived(env, rod_axis, rod_base, cur, sol_prev, verbose=True):
     gt_ok = env.is_success() if GT_VERIFY else None
     gt_mm = env.insert_metrics() if GT_VERIFY else None
 
-    # ---- 6) 收尾: 成功保持, 失败先抬后松; 随后退开(用感知杆轴方向退, 不读 GT) ----
-    if not success:
-        sc, _ = env.sleeve_pose()
-        goto_p(env, sc, rod_axis, sc + np.array([0, 0, 0.045]), rod_axis, 0.6, env.jaw_grip, cur, sol_prev)
-    grip_p(env, env.sleeve_pose()[0], JAW_OPEN, 0.6, cur, sol_prev)
-    env.grasp_active = False
-    env.grasp_off_local = np.zeros(3)
-    env.grasp_axis_local = Z_AXIS.copy()
-    sc, _ = env.sleeve_pose()
-    goto_p(env, sc, rod_axis, sc + np.array([0.02, 0.07, 0.07]), rod_axis, 1.0, JAW_OPEN, cur, sol_prev)
-
     if verbose:
         print(f"[推入] 指令推进={INSERT_TARGET * 1000:.1f}mm "
               f"轴夹角={np.degrees(np.arccos(min(1, align_cos))):.2f}° "
@@ -362,16 +354,45 @@ def push_in_perceived(env, rod_axis, rod_base, cur, sol_prev, verbose=True):
             print(f"[验证·离线GT] is_success={gt_ok}  实测重叠={gt_mm['overlap'] * 1000:.1f}mm "
                   f"横向={gt_mm['lateral'] * 1000:.1f}mm 轴向={np.degrees(np.arccos(min(1, gt_mm['align_cos']))):.2f}° "
                   f"(阈值 重叠{INSERT_SUCCESS * 1000:.0f}mm/横向{LATERAL_TOL * 1000:.0f}mm/轴向{ALIGN_TOL_DEG}°)  <- 仅评测, 非控制器输入")
+    rel_f = final_sc - rod_base
+    final_lat = float(np.linalg.norm(rel_f - float(rel_f @ rod_axis) * rod_axis))
     return {"success": bool(success), "jammed": jammed,
             "insert_overlap_mm": float(final_ov * 1000),
-            "advanced_mm": INSERT_TARGET * 1000}
+            "advanced_mm": INSERT_TARGET * 1000,
+            "final_lateral_mm": final_lat * 1000.0,
+            "gt_success": bool(gt_ok) if GT_VERIFY else None,
+            "gt_overlap_mm": float(gt_mm["overlap"] * 1000) if GT_VERIFY else None,
+            "gt_lateral_mm": float(gt_mm["lateral"] * 1000) if GT_VERIFY else None,
+            "gt_align_deg": float(np.degrees(np.arccos(min(1.0, gt_mm["align_cos"])))) if GT_VERIFY else None}
 
 
-def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
-    """第三步(脚本版全流程): 对准 + 推入 + 收尾。仅用感知 + 本体, 不读 GT。"""
+def insert_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True, n_retry=2):
+    """第三步(脚本版全流程): 对准 + 推入 + 卡阻重试 + 收尾。仅用感知 + 本体, 不读 GT。
+
+    卡阻恢复(确定性启发式, 非 RL): 推入中若重叠停滞(jammed 且未达成功), 抬起套筒脱离杆,
+    重新对准(把套筒轴线/中心重新贴回感知杆轴), 再推一次。最多 n_retry 次额外尝试。
+    纯推入一旦楔死无法自定心(杆口没咬住), 必须"抬起-重对准-再推"才能恢复。
+    """
     cur, sol_prev, align_axis_deg = align_sleeve_perceived(
         env, rod_axis, rod_tip, rod_base, verbose=verbose)
     rinfo = push_in_perceived(env, rod_axis, rod_base, cur, sol_prev, verbose=verbose)
+    for _ in range(n_retry):
+        if rinfo["success"] or not rinfo["jammed"]:
+            break
+        # ---- 恢复: 抬离杆 -> 重新对准 -> 再推 ----
+        sc, _ = env.sleeve_pose()
+        goto_p(env, sc, rod_axis, sc + np.array([0, 0, 0.05]), rod_axis, 0.6, env.jaw_grip, cur, sol_prev)
+        cur, sol_prev, align_axis_deg = align_sleeve_perceived(
+            env, rod_axis, rod_tip, rod_base, verbose=verbose)
+        rinfo = push_in_perceived(env, rod_axis, rod_base, cur, sol_prev, verbose=verbose)
+        rinfo["retried"] = True
+    # ---- 收尾释放(仅最终一次) ----
+    grip_p(env, env.sleeve_pose()[0], JAW_OPEN, 0.6, cur, sol_prev)
+    env.grasp_active = False
+    env.grasp_off_local = np.zeros(3)
+    env.grasp_axis_local = Z_AXIS.copy()
+    sc, _ = env.sleeve_pose()
+    goto_p(env, sc, rod_axis, sc + np.array([0.02, 0.07, 0.07]), rod_axis, 1.0, JAW_OPEN, cur, sol_prev)
     rinfo["align_axis_deg"] = align_axis_deg
     return rinfo
 
