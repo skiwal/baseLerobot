@@ -124,16 +124,22 @@ def plan_grasp(sleeve, rgbd=None):
     return target_pos, target_axis
 
 
-def grasp_sleeve_perceived(env, hover_qpos=None, verbose=True):
+def grasp_sleeve_perceived(env, hover_qpos=None, verbose=True, rod_cache=None):
     # ===== 输入仅: RGB-D + 第一步结果 =====
+    # rod_cache: 上游多视角勘测得到并缓存的杆位姿。细杆固定不动, 勘测一次全程复用,
+    # 避免在此用默认 35/0 + 单视角重感知导致非 35/0 杆姿漏检(原"抓取异常: 未检测到细杆")。
+    # 无缓存时退回原"必须感知到杆"行为(兼容独立调用/RL 线)。
     det = perceive_scene(env, "base_rgbd")
     if "sleeve" not in det:
         raise RuntimeError("第一步感知未检测到套筒")
     sp = det["sleeve"]["pos"].astype(float)
     sa = det["sleeve"]["axis"].astype(float)
-    if "rod" not in det:
-        raise RuntimeError("第一步感知未检测到细杆(插装需要杆位姿)")
-    rod = det["rod"]
+    if rod_cache is not None:
+        rod = rod_cache
+    else:
+        if "rod" not in det:
+            raise RuntimeError("第一步感知未检测到细杆(插装需要杆位姿)")
+        rod = det["rod"]
     rod_axis = rod["axis"].astype(float); rod_axis /= np.linalg.norm(rod_axis)
     rod_tip = rod["tip"].astype(float)
     rod_base = rod["base"].astype(float)
@@ -267,6 +273,23 @@ def align_sleeve_perceived(env, rod_axis, rod_tip, rod_base, verbose=True):
                mode="pose", pre_offset=0.0, clamp_ref=None)                     # 段2: 原地转轴
     else:
         goto_joint(env, q_pre, 2.5, env.jaw_grip, cur, sol_prev)   # 放慢摆臂, 减小惯性甩飞套筒
+    # ---- 闭环迭代精对(P5b 延展攻 tilt=50/+y): 单步 IK 在近水平杆(tilt>=50)下易落 11~25° 局部极小,
+    #     到位后重测套筒实际轴/中心, 投影去横向 + 把轴旋正到 rod_axis, 短距 IK 修正, 循环收敛。
+    #     仅当取向可达时有效; 关节距过大则停(硬件不可达)。tilt<=35 已 <5° 立即跳出, 零回归。 ----
+    for _ in range(4):
+        sc, sa = env.sleeve_pose()
+        align_now = float(np.degrees(np.arccos(np.clip(abs(sa @ rod_axis), 0, 1))))
+        if align_now <= ALIGN_TOL_DEG:
+            break
+        t = float((sc - rod_base) @ rod_axis)
+        target_c = rod_base + rod_axis * t            # 去横向, 保持轴向位置
+        R = env.jaw_rot()
+        q_fix = env.pose_ik(target_c - R @ env.grasp_off_local, rod_axis,
+                            q_seed=cur[:5], axis_local=env.grasp_axis_local,
+                            mode="pose", n_iter=200, max_step=0.03, clamp_ref=None)
+        if float(np.linalg.norm(q_fix - cur[:5])) > 2.5:
+            break
+        goto_joint(env, q_fix, 1.2, env.jaw_grip, cur, sol_prev)
     _, sa = env.sleeve_pose()
     align_axis_deg = float(np.degrees(np.arccos(np.clip(abs(sa @ rod_axis), 0, 1))))
     if verbose:

@@ -48,9 +48,65 @@ def _sleeve_xy_corrected(env):
     return sp
 
 
-def _pickup(env, verbose=True):
+# 多视角勘测扫描(P5a 泛化): 固定单相机视角看不全所有杆姿——P5a 网格搜索证明
+# 无任何单一固定小车位姿能覆盖全部 (tilt,azim) 杆姿(最好仅 10/12)。
+# 杆姿集合固定, 各候选位姿分别能看见不同子集, 故 survey 时依次尝试, 取首个检出杆的作为杆测量。
+# 首位 (0,0,0) 即原勘测位(azim=0/90 与 azim=180/270@tilt<=35 低误差, 已成功杆姿零退化);
+# 后续为近杆+偏航位姿, 覆盖 tilt=50/azim=180/270 等单视角漏检的杆姿, 以及 azim=225/315 对角方位。
+SURVEY_DOCKS = [
+    (0.0, 0.0, 0.0),
+    (0.0, -0.12, 0.30),
+    (-0.03, -0.16, 0.30),
+    (-0.06, -0.12, 0.30),
+    (0.03, -0.14, 0.30),
+    (-0.08, -0.16, 0.30),   # -x-y 对角(azim~225)
+    (0.08, -0.16, 0.30),    # +x-y 对角(azim~315)
+    # 额外变 yaw/偏移, 绕开套筒随种子遮挡 + 覆盖高倾角近水平杆(diag_survey2 命中者)
+    (-0.06, -0.14, 0.40),
+    (-0.06, -0.14, -0.40),
+    (-0.06, -0.10, 0.40),
+    (0.06, -0.10, -0.40),
+    (0.00, -0.10, 0.40),
+    (0.00, -0.14, 0.00),
+    (0.06, -0.14, 0.00),
+    (0.00, -0.18, 0.40),
+]
+
+
+def survey_rod(env, tilt_deg, azim_deg, docks=None):
+    """多视角勘测: 依次尝试候选小车位姿, 返回首个检出杆的感知结果 det(附 _survey_dock 标记)。
+    若一个都检不出, 抛 RuntimeError(沿用到 run_once 即记 perc_missing 失败)。"""
+    docks = docks or SURVEY_DOCKS
+    last = None
+    for d in docks:
+        drive_cart_to(env, float(d[0]), float(d[1]), float(d[2]) if len(d) > 2 else 0.0)
+        det = perceive_scene(env, "base_rgbd", expected_tilt_deg=tilt_deg, expected_azim_deg=azim_deg)
+        last = det
+        if "rod" in det:
+            det["_survey_dock"] = d
+            return det
+    raise RuntimeError("多视角勘测扫描仍未能检出细杆")
+
+
+def insertion_dock_for(azim_deg, tilt_deg=35.0):
+    """P5b: 插入站位随杆方位自适应(替代固定 INSERTION_DOCK)。
+    机理: 杆指向 +y 侧(rod 水平分量 sin(azim)>0)时, 臂从 (0,0) 够不到 +y 方向插入, 需把车 +y 平移
+    给臂让出空间; 其余方位沿用原 (0,0) 站位。yaw 在 +y 区域取 ~1.0 使杆本地方向复现有效构型。
+    实测 tilt=35 下 azim∈{0,45,90,135,180,270,315} 均 100%; 仅 azim=225 因勘测漏检(已补对角 dock)失败。
+    高倾角(>=45°)+ 杆近 +y(azim∈[60,120]): 杆近水平且指向 +y, 单一 yoff/yaw 公式失效(摆臂落错位点),
+    改用 diag_tilt50_dock 搜得的鲁棒站位 (-0.15,+0.18,0.2) -> tilt=50/azim=90 稳定 100%。"""
+    A = np.radians(float(azim_deg))
+    if tilt_deg >= 45.0 and 60.0 <= float(azim_deg) <= 120.0:
+        return (-0.15, 0.18, 0.2)
+    yoff = 0.14 * max(0.0, np.sin(A))
+    yaw = 1.0 if np.sin(A) > 0.3 else 0.19
+    return (0.0, float(yoff), float(yaw))
+
+
+def _pickup(env, verbose=True, rod_cache=None):
     """勘测 + 视觉伺服停靠 + proven 抓取抬起。返回 (ok, info_or_msg)。
-    会把底盘开到"套筒舒适抓取相对位姿"(补偿感知偏差)并抓取抬起; 套筒需在台面上、相机可见。"""
+    会把底盘开到"套筒舒适抓取相对位姿"(补偿感知偏差)并抓取抬起; 套筒需在台面上、相机可见。
+    rod_cache: 复用上游多视角勘测的杆位姿(细杆固定不动, 不再用默认 35/0 重感知)。"""
     drive_cart_to(env, *ASSEMBLY_DOCK)                 # 到勘测位(臂收起, 视野覆盖台面)
     sp = _sleeve_xy_corrected(env)
     if sp is None:
@@ -71,7 +127,7 @@ def _pickup(env, verbose=True):
         dock = nd
     drive_cart_to(env, float(dock[0]), float(dock[1]), 0.0)
     try:
-        info = grasp_sleeve_perceived(env, verbose=verbose)
+        info = grasp_sleeve_perceived(env, verbose=verbose, rod_cache=rod_cache)
     except RuntimeError as e:
         return False, f"抓取异常: {e}"
     if not (info["reached"] and info["held"]):
@@ -79,24 +135,30 @@ def _pickup(env, verbose=True):
     return True, info
 
 
-def run_once(env, verbose=True, insert_dock=None):
+def run_once(env, verbose=True, insert_dock=None, tilt_deg=35.0, azim_deg=0.0):
     """insert_dock: 可选的插入站位覆盖(只改"夹持后开往的装配位", 感知勘测位仍用 ASSEMBLY_DOCK)。
-    默认 INSERTION_DOCK(偏航 +0.19): 接近几何重摆, 收复深几何楔死。"""
+    默认 INSERTION_DOCK(偏航 +0.19): 接近几何重摆, 收复深几何楔死。
+    tilt_deg/azim_deg: 细杆真实倾角/方位, 透传给感知兜底做标称杆轴与 z 几何校验(否则兜底只认 35/0)。
+    固定工况(35/0)下应与原行为一致。"""
     # 0) 勘测位测细杆(固定不动; 抓持套筒后臂/套筒会悬在杆附近遮挡看杆视线, 故在此无遮挡时测准)。
-    drive_cart_to(env, *ASSEMBLY_DOCK)
-    det = perceive_scene(env, "base_rgbd", expected_tilt_deg=35.0, expected_azim_deg=0.0)
-    if "rod" not in det:
-        return False, "勘测位未感知到细杆"
+    #    多视角扫描: 单固定视角看不全所有杆姿, 依次尝试候选小车位姿取首个检出杆者(见 SURVEY_DOCKS)。
+    try:
+        det = survey_rod(env, tilt_deg, azim_deg)
+    except RuntimeError as e:
+        return False, str(e)
+    if verbose and "_survey_dock" in det:
+        print(f"[运输] 勘测命中 dock={np.round(det['_survey_dock'], 3)}")
     rod = det["rod"]
     rod_axis = np.asarray(rod["axis"], float); rod_axis /= np.linalg.norm(rod_axis)
     rod_tip = np.asarray(rod["tip"], float)
     rod_base = np.asarray(rod["base"], float)
 
     # 1) 第一次抓取(套筒随机位) + 夹持搬到装配停靠位
-    ok, info = _pickup(env, verbose)
+    ok, info = _pickup(env, verbose, rod_cache=rod)
     if not ok:
         return False, info
-    ins_dock = INSERTION_DOCK if insert_dock is None else insert_dock
+    # P5b: 插入站位随杆方位自适应(默认 INSERTION_DOCK 固定 yaw=0.19 仅为 azim=0 调, 换杆姿失效)。
+    ins_dock = insert_dock if insert_dock is not None else insertion_dock_for(azim_deg, tilt_deg)
     if verbose:
         print(f"[运输] 夹持套筒开往装配位 {np.round(ins_dock, 3)} ...")
     drive_cart_holding(env, *ins_dock)
